@@ -1,0 +1,240 @@
+#!/usr/local/bin/perl -w
+# $Id: tpairs,v 1.20 2005/01/23 18:59:53 reid Exp $
+
+#
+#   tpairs - perl script to patch up the awful output to the
+#       pairings list from Accelerat
+
+#   Copyright (C) 1995, 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT
+#   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+#   FITNESS FOR A PARTICULAR PURPOSE.
+#
+
+use strict;
+require 5.001;
+use IO::File;
+use Games::Go::AGATourn;               # stuff to parse AGA tournament data files
+our ($myName, $agaTourn, $rules);
+
+$myName = $0;                   # full pathname of this file
+$myName =~ s".*/"";             # delete any preceding path
+
+sub Format {
+    my ($inFileName) = @_;
+
+    # don't read any round files
+    $agaTourn = Games::Go::AGATourn->new(Round => 0);
+    $agaTourn->ReadRoundFile($inFileName);
+    die("Error in AGATourn (pairing file not written)\n") if (not defined($agaTourn) or $agaTourn->Error);
+    my $round = $agaTourn->Round();
+    $round = 1 unless defined($round);
+    if (exists $agaTourn->{agaTourn}{Directive}{RULES}) {
+        $rules = lc $agaTourn->{agaTourn}{Directive}{RULES}[0];
+    } else {
+        $rules = 'ing';
+    }
+    my $outFileName = "pairs" . $round;
+    print("Writing $outFileName\n");
+    WritePairs($outFileName, $round);
+}
+
+sub WritePairs {
+    my ($fname, $round) = @_;
+
+    my $outFP = IO::File->new();
+    die( "Error opening $fname for writing\n") unless (open($outFP, ">$fname"));
+    my ($str, $fW);
+    my $line = 9999;
+    my $maxNameLength = $agaTourn->NameLength();     # get max name length
+    $maxNameLength += 2;                                # give a little extra space if we can
+    $maxNameLength = 30 if ($maxNameLength > 30);       # top limit on name length (to fit in 80 columns)
+    $fW = $maxNameLength + 6;
+    my $games = $agaTourn->GamesList();              # "$wId,$bId,$resu,$handi,$komi,$round
+    my $names = $agaTourn->Name();
+    my $rating = $agaTourn->Rating();
+    my $comments = $agaTourn->Comment();             # so we know BYEs from DROPs
+    my $rounds = $agaTourn->Rounds();
+    my $tourney = $agaTourn->Tourney();
+    my $groups = $agaTourn->Directive('GROUPS');
+    if (defined($groups)) {
+        $groups = $groups->[0];                         # get first group from array (should be only one anyway)
+    } else {
+        $groups = 1;                                    # no groups directive? make one group
+    }
+    my %byes = %{$names};                               # copy to find BYEs (by removing all active players)
+    my ($wId, $bId, $resu, $handi, $komi, $gRound);
+    my $ii = 1;
+    my $page = 1;
+    my $groupEnd = 0;                                   # print a header right away
+    foreach (@$games) {
+        ($wId, $bId, $resu, $handi, $komi, $gRound) = split(/,/, $_);
+        $round = $gRound unless(defined($round));
+        print(STDERR "Round mis-match - was $round, but now I see $gRound") if ($round != $gRound);
+        unless (exists($byes{$wId})) {
+            print(STDERR "White player $wId not in register.tde?\n");
+            next;
+        }
+        delete($byes{$wId});                                    # not a BYE - remove him
+        unless (exists($byes{$bId})) {
+            print(STDERR "Black player $bId not in register.tde?\n");
+            next;
+        }
+        delete($byes{$bId});                                    # not a BYE - remove him
+        if (($line > 55) || ($ii > $groupEnd)) {
+            $line = printHeader($outFP, $tourney, $page, $round, $rounds, $fW);
+            $page++;
+            $groupEnd += @$games / $groups;
+        }
+        my $agaKomi = $komi;
+        if ($rules eq 'ing') {
+            $komi += 0.5;
+            $komi = -7.5 if ($komi == -6.5);
+            $komi = 0 if ($komi == -0.5);
+        }
+        if ($handi) {
+            $str = "$handi handi";
+            # $str .= ", $komi komi" if ($agaKomi + $handi != 1);
+        } elsif ($komi) {
+            $str = "$komi komi";
+        } else {
+            $str = 'no komi';
+        }
+        $wId = sprintf("%*.*s %-5.1f", $maxNameLength, $maxNameLength, $names->{$wId}, $rating->{$wId});
+        $bId = sprintf("%5.1f %-*.*s", $rating->{$bId}, $maxNameLength, $maxNameLength, $names->{$bId});
+        printf($outFP "\n%3d %*.*s %*.*s ($str)\n", $ii++, $fW, $fW, $wId, -$fW, $fW, $bId);
+        $line += 2;
+    }
+    $outFP->print("\n");
+    $line++;
+    my ($type, $f);
+    if (keys(%byes) + $line > 55) {
+        $outFP->print("\f");
+        $line = 0;
+    }
+    foreach (sort {$rating->{$b} <=> $rating->{$a}} (keys(%byes))) {
+        if ($line > 55) {
+            $line = printHeader($outFP, $tourney, $page, $round, $rounds, $fW);
+            $page++;
+        }
+        my $type = 'BYE: ';
+        my $c = lc($comments->{$_});
+        $type = 'DROP:' if ($c =~ m/drop/);
+        $outFP->printf(" $type %5.1f $byes{$_}\n", $rating->{$_});
+    }
+    $outFP ->close();
+}
+
+sub printHeader {
+    my ($outFP, $tourney, $page, $round, $rounds, $fW) = @_;
+
+    $outFP->print("\f") if ($page > 1);
+    $outFP->print("\n             $tourney\n");
+    $outFP->print("\n      Round $round of $rounds, page $page\n");
+    $outFP->printf("\n    %*.*s %-*.*s\n", $fW, $fW, 'White  ', $fW, $fW, '  Black');
+    return(7);          # we're now on this line number
+}
+
+sub Usage {
+    print("Usage: tpairs [filename or round number]    reformat a pairs file from the tde.  output to pairsN\n");
+}
+
+# OK, here is where things actually happen
+
+my $ii;
+
+die ("register.tde doesn't seem to exist...\n") unless (-f 'register.tde');
+if (@ARGV) {
+    for ($ii = 0; $ii < @ARGV; $ii++) {
+        unless (-f $ARGV[$ii]) {
+            if (-f "$ARGV[$ii].tde") {      # try adding .tde
+                $ARGV[$ii] .= '.tde';
+            } else {
+                print("no such file: '$ARGV[$ii]' or '$ARGV[$ii].tde'\n");
+                Usage();
+                exit(1);
+            }
+        }
+        Format($ARGV[$ii]);
+    }
+} else {
+    $ii = 1;
+    while (-f "$ii.tde") {$ii++};
+    $ii--;
+    Format("$ii.tde");
+}
+
+
+__END__
+
+=head1 NAME
+
+tpairs - convert pairings from AGA format to printable
+
+=head1 SYNOPSIS
+
+tpairs [ round_number ]
+
+=head1 DESCRIPTION
+
+The format for round pairing files (1.tde, 2.tde, etc) provided by the AGA is pretty much
+unreadable.  tpairs reformats the files into a form suitable for printing and posting on the
+wall for the players to find their partners, etc. 
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<round_number>
+
+The default is to reformat the current round (based on the last n.tde file).  Previous rounds can
+be reformated by providing the round number as a command line argument.
+
+=back
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o around(1)   - pair a tournament round
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tpairs(1)   - convert pairings from AGA format to printable
+
+=item o tscore(1)   - score a tournament
+
+=item o send2AGA(1) - prepare tournament result for sending to AGA
+
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=item o Games::Go::TDEntry(3)  - perl/Tk widget support for TDFinder
+
+=item o Games::Go::TDFinder(3) - perl/Tk tdfind support widgets
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 1995, 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

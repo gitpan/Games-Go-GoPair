@@ -1,0 +1,48 @@
+Games::Go::GoPair - pure-perl extension for running AGA tournaments
+=================
+
+The Games::Go::GoPair module 'use's the Games::Go::AGATourn and
+the Algorithm::Pair::Best modules to provide pairing for go
+tournaments.  The file format is standard to the American Go
+Association (AGA).
+
+The following scripts are included in this package:
+
+    tdfind      a perl/Tk script for finding go players in the
+                    TDLIST and registering them into register.tde
+    aradjust    a perl/Tk script for adjusting the pairings and
+                    entering the game results
+    tpairs      a perl script to re-format pairing lists
+    rats        a perl script for calculating ratings adjustments
+                    based on game results
+    gopair      a perl script to do pairings (either 'Best' or
+                    Round Robin) for the next round
+    tscore      a perl script to score the tournament (also creates
+                    a tournament summary)
+    send2aga    a perl script to collect tournament result data
+                    and prepare it for submission to the AGA
+
+The following support modules are also included:
+    Erf.pm          copy of error function module from
+                        Math::SpecFun (used by rats)
+    TDEntry.pm      Tk/perl widget entry support for TDFinder
+                        widget
+    TDFinder.pm     Tk/perl widget support for tdfind script
+
+
+HOW TO BUILD AND INSTALL
+
+perl Makefile.PL
+make
+make test
+make install
+
+
+COPYRIGHT
+
+Copyright 1999-2005 by Reid Augustin (reid@hellosix.com).
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.3 or,
+at your option, any later version of Perl 5 you may have available.
+

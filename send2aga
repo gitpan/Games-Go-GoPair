@@ -1,0 +1,161 @@
+#!/usr/bin/perl -w
+# $Id: send2aga,v 1.1 2005/01/23 18:59:20 reid Exp $
+
+#
+#   Copyright (C) 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+#
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but
+#   WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+#   or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# todo:
+
+=head1 NAME
+
+send2aga - perl script to prepare go tournament results for
+submission to AGA
+
+=head1 SYNOPSIS
+
+    $ send2aga
+
+=head1 DESCRIPTION
+
+send2aga reads register.tde and all available round files (1.tde,
+2.tde, etc) and collects all the tournament data into a single file
+(send2aga.tde) ready to submit to the American Go Association (AGA)
+ratings coordinator:
+
+    mailto://ratings@usgo.org
+
+=cut
+
+
+# first, some boilerplate:
+use strict;
+require 5.001;
+BEGIN {
+    our $VERSION = sprintf "%d.%03d", '$Revision: 1.1 $' =~ /(\d+)/g;
+}
+
+use IO::File;
+use Games::Go::AGATourn;
+
+sub Usage {
+    print("\n",
+          "Usage: send2aga      prepare tournament data for submission to AGA.\n",
+          "                     Please email the output file (send2aga.tde) to:\n",
+          "                         ratings\@usgo.org\n",
+          "\n");
+}
+
+=head1 OPTIONS
+
+None.
+
+=cut
+
+for (my $ii = 0; $ii < @ARGV; $ii++) {
+    print("I don't expect any command line arguments: $ARGV[$ii]\n");
+    Usage();
+    exit(1);
+}
+
+# read register.tde and all round files
+our $agaTourn = Games::Go::AGATourn->new();
+die("Error in AGATourn\n") if (not defined($agaTourn) or $agaTourn->Error);
+
+my $sendFd = IO::File->new(">send2aga.tde") or
+    die "Can't open send2aga.tde for writing: $!\n";
+
+my $regFd = IO::File->new("<register.tde") or
+    die "Can't open register.tde for reading: $!\n";
+
+while (<$regFd>) {
+    if (m/^\s*#/) {
+        $sendFd->print($_) or   # copy register comments to send file
+            die "Error writing to send2aga.tde: $!\n";
+    }
+}
+$regFd->close;
+
+my $name = $agaTourn->Name;
+my $rating = $agaTourn->Rating;
+my $gamesList = $agaTourn->GamesList;
+my @noResult;
+foreach (@{$gamesList}) {
+    my ($whiteID, $blackID, $result,
+        $handicap, $komi, $round) = split(',', $_);
+    $result = uc($result);
+    if ($result =~ m/^[BW]$/i) {
+        $sendFd->print("$whiteID $blackID $result $handicap $komi\n");
+    } else {
+        $noResult[$round]++;
+    }
+}
+
+my @msg;
+for (my $ii = 0; $ii < @noResult; $ii++) {
+    if (defined($noResult[$ii]) and ($noResult[$ii] > 0)) {
+        my $plural = ($noResult[$ii] == 1) ? '' : 's';
+        push (@msg, "$noResult[$ii] unfinished game$plural in round $ii")
+    }
+}
+if (@msg) {
+    STDERR->print("\nWARNING:\n");
+    STDERR->print(join (' and ', @msg), "\n");
+    STDERR->print("Unfinished games are not reported to the AGA.\n");
+}
+
+foreach (sort( { ($rating->{$b} <=> $rating->{$a}) || ($name->{$a} cmp $name->{$b}) } keys(%{$rating}))) {
+    $sendFd->print("$_\n",
+                   "\tNAME=\"$name->{$_}\"\n",
+                   "\tRATING=$rating->{$_}\n",
+                   "\tSIGMA=", $agaTourn->Sigma($_), "\n",);
+}
+
+
+
+
+
+__END__
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o rats(1)     - calculate new ratings from game results
+
+=item o gopair(1)   - pick next round pairings
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tscore(1)   - score a tournament
+
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 1995, 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

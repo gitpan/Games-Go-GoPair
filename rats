@@ -1,0 +1,1347 @@
+#!/usr/bin/perl -w
+# $Id: rats,v 1.12 2005/01/17 04:11:39 reid Exp $
+
+#   rats
+#
+#   Copyright (C) 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+#
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but
+#   WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+#   or FITNESS FOR A PARTICULAR PURPOSE.
+#
+
+=head1 NAME
+
+rats - Perl script to calculate ratings adjustments from go tournament results
+(using AGA format files).
+
+=head1 SYNOPSIS
+
+    $ rats [ round_number ]
+
+=head1 DESCRIPTION
+
+The rats script uses the same algorithm used by the American Go Association
+(AGA), and allegedly the Internet Go Server (IGS) to adjust go players'
+ratings from new game results during a tournament.  The adjusted results might
+be used (for example) to feed the pairing routine for the next round (similar
+to how the Accelerat pairing program works).
+
+Normally, rats attempts to read the register.tde file and all the available
+round files (in the form 1.tde, 2.tde, etc).  If round_number is provided on
+the command line, rats reads only up to (and including) that round:
+
+    $ rats 3     # adjust ratings based on rounds 1, 2, and 3 only
+
+NOTE:  The rats implementation is taken from Fred Hansen's "Pseudo-code for a
+ratings algorithm" posted to rec.games.go in late 1995, also currently
+available at:
+
+        http://www-2.cs.cmu.edu/~wjh/go/Ratings.pseudo-code
+
+=cut
+
+#       Fred's original writeup is included below and marked with '# --'.  I
+#       merely provide a perl implementation of Fred's pseudo-code.  I have
+#       re-arranged some of Fred's lines so that they organize better into the
+#       Player, Game, and main packages.  All mistakes of implementation are
+#       mine.
+
+#       Implementation strategy:  we will provide a Player object to
+#       encapsulate the p.* data and methods, and a Game object to encapsulate
+#       the g.* data and methods.  We use an AGATourn object to parse all the
+#       input files.  Then it's just a matter of feeding the collected data
+#       into a collection of Player and Game objects and running the
+#       estimate_ratings() routine.
+
+# first, some boilerplate:
+use strict;
+require 5.001;
+BEGIN {
+    our $VERSION = sprintf "%d.%03d", '$Revision: 1.12 $' =~ /(\d+)/g;
+}
+our $psense;    # global flag to turn off game bad probability reporting
+our %track;
+
+# -- Pseudo-code for a ratings algorithm
+# --                                                      revised: October, 1995
+# --      Algorithm in C and C++ by Paul Matthews
+# --      Pseudo-code version by Wilfred J. Hansen
+# -- 
+# -- This algorithm computes p.rating, the rating for each player, p,
+# -- assuming that the player's initial rating, p.seed, is within a few 
+# -- stones of the correct value.  
+# -- The approach is to measure the likelihood of each player's rating 
+# -- and the likelihood of the outcome of each game given the difference
+# -- in the opponent's ratings.  Multiplying all these likelihoods gives 
+# -- likelihood of the set of game outcomes for the given set of ratings.
+# --
+# -- Each iteration step adjusts each player's rating by +delta, -delta,
+# -- or not at all, depending on which increases the likelihood of the
+# -- outcomes for the player's games.  Then the likelihood for the entire
+# -- collection of ratings and game outcomes is recomputed and the change 
+# -- by the current delta is accepted if the likelihood increased.  The 
+# -- iteration repeats with diminishing values of delta until the desired
+# -- significance is achieved.
+# -- 
+# -- For general discussion of the statistics, see: 
+# --      Elo, Arpad E.,  Ratings of Chessplayers, past and present.  
+# --              NY: Arco Pub., 1986
+# --      Joe, Harry, "Rating systems based on paired comparison models", 
+# --              Statistics and Probability Letters v. 11, 1991 p. 343-347
+# --      David, H. A., "The method of paired comparisons"
+# -- 
+# -- 
+# -- In this algorithm, a difference of one in rating is intended to
+# -- indicate a difference of one stone in strength.  There is no built-in
+# -- normalization, so there is no way to know if a rating of 1.00
+# -- corresponds to Shodan;  however, relative values should be a 
+# -- fair approximation of relative strength.  
+# -- 
+# -- Strictly speaking, the algorithm has no notion of a difference of one 
+# -- stone;  the ratings are based on the players announced ratings.  If 
+# -- players adopt consistent ratings that differ by, say, half a stone,
+# -- the computed ratings will be based on that measure.  
+# -- 
+# -- Two special data types, Rating and Likelihood, appear below.
+# --      Both are implemented as floating values.  
+# -- Rating is a player rating: a dan value is expressed as the corresponding 
+# --      positive number and the kyu value k is entered as 1-k
+# --      (so 1 kyu is zero, 2 kyu is -1, and so on).  
+# -- Likelihood is similar to a probability.  It is a mapping of a rating 
+# --      or game result into [0,1] such that higher values correspond
+# --      to more likely ratings or results.
+# -- 
+# -- Revision: Oct, 1995
+# --    changed compute_player_impact to recompute p.sigma instead of
+# --      dropping the player
+# -- Revisions: Oct, 1993
+# --      added prune_unrateable_players
+# --      added player_sensitivity to compute sigma for next cycle
+# --      added declarations of all local variables
+# --      fixed parameter list for call on player_pr in propose_ratings
+# --      changed compute_player_impact to drop player if rating is too far from seed
+# -- 
+# -- 
+# -- 
+# -- Here are parameters as used for the AGA rating system:
+# --
+package Player;
+
+use Carp;
+
+our $AUTOLOAD;  # package global
+
+use constant PI           => 4 * atan2(1, 1);
+use constant LOG_2        => log(2);
+use constant LOG_SQRT_2PI => log(sqrt(2 * PI));
+
+
+# -- p.seed: Rating  -- Players's initial rating.  
+# --      The latest rating at which the player played in a tournament.
+# -- 
+# -- p.sigma: Rating = -- old constant values
+# --      .5 for players rated at least twice before
+# --      .8 for players rated once before
+# --      1.0 for previously unrated players 10 kyu and above
+# --      2.0 for others
+# -- As shown below in player_sensitivity, the current AGA software, 
+# -- which went into production in 1993, estimates a posterior variance 
+# -- (sigma) for each player together with the player's rating; 
+# -- both are carried forward from one rating period to the next.
+# -- AGA tournament players begin at sigma=0.8, unless a TD indicates that
+# -- an entry rank/rating is guesswork, in which case we use sigma=2.0.   - PM
+# -- 
+# -- information for each player
+# --
+# -- Player:::
+
+# lifted from perltoot:  %fields is a hash with the names and default
+#    values of all the user accessable data in the object.  Access methods
+#    are AUTOLOADed (see below)
+our %fields = (
+# --         rating: Rating  -- current rating estimate 
+    rating     => -99,          # 99 kyu
+# --         pr: Likelihood  -- what is the likelihood of the current rating?
+    log_pr     => -999,
+# --         oldpr: Likelihood       -- pr from prior iteration
+    log_oldpr => -999,
+# --         seed: Rating    -- initial rating 
+    seed     => -99,            # 99 kyu
+# --         sigma: Rating   -- standard deviation of curve of likelihood of
+# --                         -- ratings in the neighborhood of seed.
+    sigma    => 1,
+# --         direction: {UP, DOWN, NONE}  -- direction to adust rating
+    direction => 'NONE',
+# --         -- also: a list of all games the player has played in
+    games     => [],            # ref to empty array
+    id        => 'no ID',       # include the player ID
+    );
+# -- 
+# -- "pr" is the likelihood that a given rating is correct
+# -- "po" similarly the likelihood that a game outcome is correct
+# -- Multiplying all pr and pr values computes the total likelihood,
+# -- "pt", that is, the likelihood of all game outcomes given a 
+# -- particular set of ratings for the players.
+
+sub new {
+    my ($proto, %args) = @_;
+
+    my $my = {
+        #_permitted => \%fields,        # pointer to class 'permitted' fields
+        %fields                         # copy of default 'permitted' fields
+        };
+    bless($my, ref($proto) || $proto);
+    # transfer user args
+    foreach my $a (keys(%args)) {
+        if ($a eq 'AGAseed') {
+            $my->AGAseed($args{$a});
+        } elsif ($a eq 'AGArating') {
+            $my->AGArating($args{$a});
+        } else {
+            $my->{$a} = $args{$a};
+        }
+    }
+    return($my);
+}
+
+# -- 
+# -- player_pr(p: Player): Likelihood
+# --      Compute the "prior distribution", pr, of the rating for player 'p'.
+# --      Assume the "correct" rating is in a sample space normally
+# --      distributed about p.seed with standard deviation p.sigma.
+# --      Compute z as the corresponding value in a normal
+# --      distribution with mean of 0 and standard deviation of 1.
+# --      Then compute the likelihood that z is the correct rating
+# --      by evaluating the normal(0,1) density function at z.
+sub player_log_pr {
+    my ($my) = @_;
+
+# -- player_pr(p: Player): Likelihood ===
+# --         z: Number = ((p.rating - p.seed) / p.sigma)
+    my $z = ($my->{rating} - $my->{seed}) / $my->{sigma};
+# --         return   exp(-z*z/2) / sqrt(2*pi)       -- normal density function
+# --         -- exp(...)/sqrt(...) is the function for the normal curve,
+# --         -- that is, a probability density function with mean 0 and s.d. 1.
+    return ((-$z * $z) / 2) - LOG_SQRT_2PI;
+}
+
+# -- player_sensitivity(p)
+# --      Computes the sigma to use for player p the next time the program is run.
+# --      The algorithm is basically numerical integration. As a first approximation,
+# --      consider the how the overall likelihood function changes as p's rating is 
+# --      varied to either side of the best estimate, with other player's ratings held 
+# --      constant.  Normalize the area under that curve to be one, thus defining 
+# --      a marginal probability density. Then integrate (X - RATING)**2 (the 
+# --      definition of variance). The square root of the result can be taken as an 
+# --      estimate of sigma.                      -PM
+# --      {Beware that variance estimates (e.g., sigmas) in general
+# --      are poor compared with central tendency estimates (e.g., ratings).
+# --      Using sigma=constant may not be much worse.}    -PM
+# --      The values of 5, the multiplier for bound, and 10, the divsor of p.sigma,
+# --      are chosen to evaluate the integral by evaluating the function 
+# --      at 100 points.
+# --
+sub player_sensitivity {
+# -- player_sensitivity(p: Player): Rating
+    my ($my) = @_;
+# print "player_sensitivity(", $my->id, ")\n";
+# --         bound: Number = 5 * p.sigma   -- units: delta Rating
+    my $bound = 5 * $my->{sigma};
+# --         psave: Rating = p.rating
+    my $psave = $my->{rating};
+# --         sumX2W: Number = 0      -- units: (delta Rating)^2 * Likelihood
+    my $sumX2W = 0;
+# --         sumW: Likelihood = 0
+    my $sumW = 0;
+# -- 
+# --         for values, x, from -bound-p.sigma/20 upto bound 
+# --                                 incrementing by p.sigma/10
+    my $inc = $my->{sigma} / 10;
+    for (my $x = -$bound - ($my->{sigma} / 20); $x < $bound; $x += $inc) {
+# --                 p.rating = psave + x
+        $my->{rating} = $psave + $x;
+# --                 -- compute variance of x, using probabilities as weights
+# --                 w: Likelihood = player_pr(p)
+        my $log_w = $my->player_log_pr;
+# --                 for each game, g, in which p played
+        foreach my $g (@{$my->{games}}) {
+# --                         w *= game_po(g)
+            $log_w += $g->game_log_po;
+        }
+# --                 sumX2W += (x * x) * w
+        my $w = exp $log_w;
+        $sumX2W += ($x * $x) * $w;
+# --                 sumW += w
+        $sumW += $w;
+    }
+# -- 
+# --         p.rating = psave
+
+    $my->{rating} = $psave;
+
+# --         return sqrt(sumX2W / sumW)
+    return sqrt($sumX2W / $sumW);
+}
+
+sub changeRating {
+    my ($my, $delta) = @_;
+
+#    if ($my->{id} eq 'USA140') {
+#        print "$my->{id}->changeRating($my->{rating} + $delta) - seed is $my->{seed}\n";
+#    }
+    if (abs(($my->{rating} + $delta) - $my->{seed}) >= 5) {
+        print "Excessive rating change for $my->{id}\n";
+    }
+    $my->{rating} += $delta;
+}
+
+# accessor methods for AGAseed and AGArating:
+# AGA ratings have a hole between 1.0 and -1.0.  seed and rating
+#    used by this algorithm need to fill that hole.  we'll do that
+#    by pulling dan ratings down to 0 and kyu ratings up to 0.
+
+sub fillHole {
+    my ($my, $rating) = @_;
+
+    if ($rating >= 1) {
+        $rating -= 1;          # pull dan ratings down to 0
+    } elsif ($rating <= -1) {
+        $rating += 1;          # pull kyu ratings up to 0
+    } else {
+        croak "$my->{id} AGAseed or AGArating between -1 and +1: $rating\n";
+    }
+    return $rating;
+}
+
+sub expandHole {
+    my ($my, $rating) = @_;
+
+    if ($rating >= 0) {
+        $rating += 1;          # dan ratings are upwards from 1
+    } else {
+        $rating -= 1;          # kyu ratings are downwards from -1
+    }
+    return $rating;
+}
+
+sub AGAseed {
+    my ($my, $seed) = @_;
+
+    $my->seed($my->fillHole($seed)) if (defined($seed));
+    return $my->expandHole($my->{seed});
+}
+
+sub AGArating {
+    my ($my, $rating) = @_;
+
+    $my->rating($my->fillHole($rating)) if (defined($rating));
+    return $my->expandHole($my->{rating});
+}
+
+if (0) {        #note: AUTOLOAD like this added about 40% to the runtime
+# AUTOLOAD accessor methods:
+
+# lifted from perltoot:
+    sub AUTOLOAD {
+        my $my = shift;
+        my $type = ref($my)
+                    or croak "$my is not an object";
+
+        my $name = $AUTOLOAD;
+        $name =~ s/.*://;   # strip fully-qualified portion
+
+        unless (exists $my->{_permitted}->{$name} ) {
+            croak "Can’t access ‘$name’ field in class $type";
+        }
+
+#   if ($my->{id} eq 'USA140') {
+#       my $new = scalar(@_) ? $_[0] : $my->{$name};
+#       print "$my->{id}->$name(", join(', ', @_), ") returns $new\n";
+#   }
+        if (@_) {
+            return $my->{$name} = shift;
+        } else {
+            return $my->{$name};
+        }
+    }
+
+    sub DESTROY {
+    # need explicit DESTROY method if we're going to use AUTOLOADing for accessors
+    }
+
+} else {
+
+    sub rating {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{rating} = shift;
+        } else {
+            return $my->{rating};
+        }
+    }
+
+    sub log_pr {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{log_pr} = shift;
+        } else {
+            return $my->{log_pr};
+        }
+    }
+
+    sub log_oldpr {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{log_oldpr} = shift;
+        } else {
+            return $my->{log_oldpr};
+        }
+    }
+
+    sub seed {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{seed} = shift;
+        } else {
+            return $my->{seed};
+        }
+    }
+
+    sub sigma {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{sigma} = shift;
+        } else {
+            return $my->{sigma};
+        }
+    }
+
+    sub direction {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{direction} = shift;
+        } else {
+            return $my->{direction};
+        }
+    }
+
+    sub games {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{games} = shift;
+        } else {
+            return $my->{games};
+        }
+    }
+
+    sub id {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{id} = shift;
+        } else {
+            return $my->{id};
+        }
+    }
+}
+
+
+
+package Game;
+
+use Carp;
+eval { require Math::Libm; };
+if ($@) {
+    print "\nMath::Libm not available\n",
+          "  I'll use Games::Go::Erf instead, but if you install Math:Libm, this\n",
+          "  program will run three times faster!\n\n";
+
+    # We need to borrow (steal?) an 'erf' function from the Math::SpecFun package
+    # (which doesn't seem to be available on CPAN).
+    require Games::Go::Erf;
+    Games::Go::Erf->import('erf');
+} else {
+    Math::Libm->import('erf');
+}
+
+our $AUTOLOAD;  # package global
+# lifted from perltoot:  %fields is a hash with the names and default
+#    values of all the user accessable data in the object.  Access methods
+#    are AUTOLOADed (see below)
+
+our %fields = (
+# -- information for each game
+# --
+# -- Game:::
+# --         handicapeqv: Rating     -- see above
+# --         po: Likelihood          -- likelihood of the outcome given the 
+# --                                 -- current rating difference of the players
+    log_po    => 0,
+# --         oldpo: Likelihood               -- po from prior iteration
+    log_oldpo => 0,
+# --         white: Player           -- refers to player info for white player
+    white     => undef,         # will be a player object
+# --         black: Player           --     ditto for black player
+    black     => undef,         # will be a player object
+# --         whitewins: Boolean      -- TRUE if W wins 
+    whitewins => undef,
+
+    handicap  => 0,             # a new Game will get the handicap and komi.
+    komi      => 6.5,           #    compute handicapeqv from these
+    evenkomi  => 6,
+    );
+
+use constant PI      => 4 * atan2(1, 1);
+use constant SQRT2   => sqrt(2);
+use constant SQRT2PI => sqrt(2 * PI);
+
+sub new {
+    my ($proto, %args) = @_;
+
+    my $my = {
+        #_permitted => \%fields,        # pointer to class 'permitted' fields
+        %fields                         # copy of default 'permitted' fields
+        };
+    bless($my, ref($proto) || $proto);
+    # transfer user args
+    foreach my $a (keys(%args)) {
+        $my->{$a} = $args{$a};
+    }
+    my @missing = grep { not defined($_) } (qw(white black handi komi whitewins));
+    croak 'Need ', join (', ', @missing), " arguments\n" if (@missing);
+# -- g.handicapeqv: Rating          -- Rating point equivalents of handicaps
+# --      === if Nstones == 0  then  .5 - .1 * komi else Nstones - .1*komi
+# --                 -- where the handicap is 'Nstones' stones on board
+# --                 -- and a 'komi' of additional points for white
+# --                 --      Nstones is 0 or 2...9
+# --                 --      -20 <= komi <= 20
+# -- The handicap equivalents in the 1993 AGA software are the same,
+# -- but are treated as point estimates with variance; thusly, large handicaps 
+# -- have less effect on ratings, but the effect is not dramatic.   -PM
+#   if ($my->{handicap} == 0) {
+#       $my->{handicapeqv} = 0.5 - (0.1 * $my->{komi});
+#   } else {
+#       $my->{handicapeqv} = $my->{handicap} - (0.1 * $my->{komi});
+#   }
+# BUGBUG: the calculation above seems to be based on the assumption that an
+#               even game komi is 5 stones.  It's important for the
+#               consistancy of this algorithm that even games (no matter what
+#               even komi is) produce a handicapeqv of 0.
+#
+#               A more rigorous calculation probably needs to know what an
+#               even game komi should be, and normalize that towards the
+#               handicap equivilents.  The handicapping table used by the AGA
+#               sets one stone per 1.1 difference in rating, so if an even
+#               game requires a komi of E, each stone should be worth 1.1 / (2
+#               * E).  A no-komi game should have a handicap equivilent of .55
+#               rating points.  A two-stone game is like -3 * E komi and a
+#               three stone game is -5 * E komi.
+#
+#               The following degenerates to the code above but with
+#               corrections for 1.1 ratings per stone and arbitrary even-game
+#               komi:
+    $my->{handicapeqv} = 0;
+    if ($my->{handicap}) {
+        $my->{handicapeqv} = $my->{handicap} * 1.1;     # by AGA definition
+    }
+    $my->{handicapeqv} += 0.55 - ((1.1 * $my->{komi}) / (2 * $my->{evenkomi}));
+    return($my);
+}
+
+# -- 
+# -- px_sigma: Rating = 1.04   -- see description of game_po, below
+use constant PX_SIGMA => 1.04;
+
+# -- game_po(g: Game): Likelihood
+# --      Compute the likelihood, po, of the outcome of game 'g'.
+# --      The likelihood that white wins is the value of the normal
+# --      distribution function evaluated at the ratings difference, 
+# --      as adjusted by the handicap stones and normalized by px_sigma.
+# --      With px_sigma of 1.04:
+# --              ratings         likelihood
+# --              difference      white wins
+# --                  0               .5
+# --                  1               .83
+# --                  2               .97
+# --      That is, if the handicap is two stones too low, white will
+# --      win 97 games out of a hundred.
+# --      The likelihood of a black win is (1 - likelihood white wins).
+# --
+sub game_log_po {
+    my ($my) = @_;
+
+# -- game_po(g: Game): Likelihood ===
+# --         rd: Number = g.white.rating - g.black.rating - g.handicapeqv
+    my $rd = $my->{white}->rating - $my->{black}->rating - $my->{handicapeqv};
+# --         p: Likelihood = .5 + erf((rd/px_sigma) / sqrt(2)) / 2
+# --         --
+# --         -- erf(x) = [2/sqrt(pi)] * integral from 0 to x of exp(-t*t) dt
+# --         -- Some Unix systems have erf.  In the expression given, it computes
+# --         -- the normal distribution function, that is, the integral of the 
+# --         -- normal density function from negative infinity
+# --         -- to rd/px_sigma, the value whose likelihood we want.
+# -- 
+# --         -- Ralston, Anthony, A First Course in Numerical Analysis, 
+# --         -- McGraw-Hill (New York, 1965), p. 21:
+# --         -- "the normal distribution function corresponding to the 
+# --         -- normal density function with zero mean and variance n/12
+# --         -- is given by 0.5 + 0.5 * erf(sqrt(6/n)x)".  
+# --         -- In the algorithm, the variance is 1, so n = 12.
+    my $p = 0.5 + (erf(($rd / PX_SIGMA) / SQRT2) / 2);
+# --         if g.whitewins return p else return 1-p
+    $p = ($my->{whitewins} ? $p : 1.0 - $p);
+#print "\$p = $p\n";
+    if (($p >= 1) or ($p <= 0)) { # BUGBUG: can $p ever be 1 or 0?
+        if ($p >= 1) {
+            $p = 1;
+        } else {
+            printf("\$p = $p: %s(% 7.3f->% 7.3f).vs.%s(% 7.3f->% 7.3f) handicapeqv=$my->{handicapeqv}\n",
+                    $my->{white}->id, $my->{white}->AGAseed ,$my->{white}->AGArating,
+                    $my->{black}->id, $my->{black}->AGAseed, $my->{black}->AGArating)
+                unless $psense;
+            $p = 1e-100;
+        }
+    }
+#    if (($my->white->id eq 'USA7491') or
+#        ($my->black->id eq 'USA7491')) {
+#        print $my->white->id, ' vs ', $my->black->id, ' game_po = ', $p, "\n";
+#    }
+    return log $p;
+}
+
+# AUTOLOAD accessor methods:
+
+if (0) {        #note: AUTOLOAD like this added about 40% to the runtime
+    # lifted from perltoot:
+    sub AUTOLOAD {
+        my $my = shift;
+        my $type = ref($my)
+                    or croak "$my is not an object";
+
+        my $name = $AUTOLOAD;
+        $name =~ s/.*://;   # strip fully-qualified portion
+
+        unless (exists $my->{_permitted}->{$name} ) {
+            croak "Can’t access ‘$name’ field in class $type";
+        }
+
+        if (@_) {
+            return $my->{$name} = shift;
+        } else {
+            return $my->{$name};
+        }
+    }
+
+    sub DESTROY {
+    # need explicit DESTROY method if we're going to use AUTOLOADing for accessors
+    }
+} else {
+
+    sub log_po {
+        my $my = shift;
+
+        if (@_) {
+#             if (($my->white->id eq 'USA7491') or
+#                 ($my->black->id eq 'USA7491')) {
+#                 print $my->white->id, ' vs ', $my->black->id, ' set po => ', $_[0], "\n";
+#             }
+            return $my->{log_po} = shift;
+        } else {
+            return $my->{log_po};
+        }
+    }
+
+    sub log_oldpo {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{log_oldpo} = shift;
+        } else {
+            return $my->{log_oldpo};
+        }
+    }
+
+    sub white {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{white} = shift;
+        } else {
+            return $my->{white};
+        }
+    }
+
+    sub black {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{black} = shift;
+        } else {
+            return $my->{black};
+        }
+    }
+
+    sub whitewins {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{whitewins} = shift;
+        } else {
+            return $my->{whitewins};
+        }
+    }
+
+    sub handicap {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{handicap} = shift;
+        } else {
+            return $my->{handicap};
+        }
+    }
+
+    sub komi {
+        my $my = shift;
+
+        if (@_) {
+            return $my->{komi} = shift;
+        } else {
+            return $my->{komi};
+        }
+    }
+
+}
+
+
+package main;
+
+use IO::File;
+use Games::Go::AGATourn;
+
+our ($prune, $agaTourn, @players, @games, %IDtoPlayer, %removePlayers);
+our $include_pr = 1;    # original algorithm is 1
+our $restore_sigma = 0; # original algorithm is 0
+our $awl_correction = 1; # all-win/all-loss correction
+our $evenKomi = 6;      # assum non-ING rules
+
+# -- maxdelta: Rating = 4      -- In successive passes, adjust ratings by 
+# --                 --  4.  2.  1.  0.5  0.25  0.125  0.0625  
+# --                 --  0.03125  0.015625  0.0078125  0.00390625
+# BUGBUG: maxdelta is probably max_delta below.
+use constant MAX_DELTA => 4;
+
+# -- 
+# -- EPSILON: Number = 1e-15   -- Very small, positive non-zero value
+use constant EPSILON => 1e-15;
+use constant LOG_THRSH => log 2;
+# -- BIG: Number = 4           -- number of standard deviations of ratings change
+# --                           --   after which to disregard player in compute_player_impact
+use constant BIG => 4;
+# -- MOSTLY: Number = 0.925  -- maximum fraction of wins or loses for prune_unrateable_players
+# --         -- a value of 0.925 implies a rating is incorrect by about 1.5 stones
+# --         -- see discussion in game_po(), below
+# --         -- If players have not played enough games, MOSTLY can be set higher.
+use constant MOSTLY => 0.925;
+
+
+# -- prune_unrateable_players()
+# --      A player is considered unratable if he or she has either mostly wins
+# --      or mostly loses.  In either case, the seed rating is probably incorrect.
+# --      Players 5 dan and above are allowed to have mostly wins.
+# --      (This routine is not in the AGA algorithm.  I have added it as a 
+# --      hueristic for situations where initial ratings may be uncertain. -wjh)
+sub prune_unrateable_players {
+# -- prune_unrateable_players()
+
+# --         wins: Number := 0
+# --         loses: Number := 0
+    my (%wins, %loses);
+    %removePlayers = ();       # clear the removal list
+# --         for each player, p
+# --                 for each game, g, which p has played
+    foreach my $g (@games) {
+# --                         if (g.whitewins) = (g.white = p) then
+        if ($g->whitewins) {
+# --                                 wins = wins + 1
+            $wins{$g->white->id}++;
+            $loses{$g->black->id}++;
+# --                         else loses := loses + 1
+        } else {
+            $wins{$g->black->id}++;
+            $loses{$g->white->id}++;
+        }
+    }
+    foreach my $p (@players) {
+        next unless(@{$p->games});
+        if ($prune) {
+# --         if (wins / (wins+loses) > MOSTLY and p.seed < 5)
+            my $games = ($wins{$p} + $loses{$p});
+            if (((($wins{$p} / $games) > MOSTLY) and
+                 ($p->seed < 5)) or
+# --                         or (loses / (wins+loses) > MOSTLY)
+                (($loses{$p} / $games) > MOSTLY)) {
+# --                 remove games in which p played
+# --                 remove p from list of players
+                $removePlayers{$p} = 1;
+            }
+        }
+    }
+}
+
+# all-wins and all-loss players can't really be estimated correctly.  For
+#   example, if a rating adjustment of +2 gets a reasonable probability for
+#   and all-wins player, then adjusting by +3 would be even better.
+#   We'll try to fix this problem by forcing each player to have at least
+#   one win and one loss.   We find the player's least probable game, and
+#   add another game that would be slightly less probable, except that we
+#   force the opposite outcome.  This should cap the tendency to over-adjust.
+#
+sub awl_correct {
+
+    return unless ($awl_correction);
+    my (%wins, %losses);
+    foreach my $g (@games) {
+#if (($g->white->id eq 'USA3835') or ($g->black->id eq 'USA3835')) {
+#    print $g->white->id, '.vs.', $g->black->id, $g->whitewins ? ' white' : ' black', " wins\n";
+#}
+        if ($g->whitewins) {
+            $wins{$g->white->id}++;
+            $losses{$g->black->id}++;
+        } else {
+            $wins{$g->black->id}++;
+            $losses{$g->white->id}++;
+        }
+    }
+    foreach my $p (@players) {
+        next unless(@{$p->games} > 1);      # less than 2 games?  skip him
+        my $id = $p->id;
+        next if (exists($losses{$id}) and exists($wins{$id}));  # you win some, you lose some
+        my $ll_g;                                               # but not this guy...
+        my $ll_log_po = 100;
+        print "provide fake game to cap id=$id\n";
+        foreach my $g (@{$p->games}) {
+            if ($g->log_po < $ll_log_po) {
+                $ll_log_po = $g->log_po;
+                $ll_g = $g;
+            }
+        }
+        my $opp = ($ll_g->white->id eq $id) ? $ll_g->black : $ll_g->white;
+        my $fakeRating = $opp->rating + 0.2;    # make fake opp just a bit stronger (assume no losses)
+        if (not exists ($wins{$id})) {          # oops, no wins, so:
+            $fakeRating = $opp->rating - 0.2;   # make fake opp just a bit weaker
+        }
+        # create fake player
+        my $fakeOpp = Player->new (
+                    id        => 'fake',
+                    seed      => $fakeRating,
+                    rating    => $fakeRating,
+                    direction => 'NONE',
+                    sigma     => 1);
+        # create the fake game
+        my $fakeGame = Game->new(
+                        white     => ($ll_g->white->id eq $id) ? $p : $fakeOpp,
+                        black     => ($ll_g->black->id eq $id) ? $p : $fakeOpp,
+                        whitewins => $ll_g->whitewins ? 0 : 1,      # reverse winner
+                        komi      => $ll_g->komi,
+                        evenkomi  => $evenKomi,
+                        handicap  => $ll_g->handicap);
+        $p->games($p->games, $fakeGame);        # add to player's list of games
+        push (@games, $fakeGame);               # add to global games list
+    }
+}
+
+# -- propose_ratings(delta: Rating)
+# --      For a ratings change of 'delta', adjust all players
+# --      according to their directions and recompute po for each game.
+# --
+sub propose_ratings {
+# -- propose_ratings(delta: Rating) === 
+    my ($delta) = @_;
+# --         for each player, p
+print "propose_ratings($delta):\n";
+    foreach my $p (@players) {
+# --                 case p.direction
+# --                         UP:     p.rating += delta
+        if ($p->direction eq 'UP') {
+            $p->changeRating($delta);
+# --                         DOWN:   p.rating -= delta
+        } elsif ($p->direction eq 'DOWN') {
+            $p->changeRating(-$delta);
+# --                         NONE:
+        }
+# --                 p.oldpr = p.pr
+        $p->log_oldpr($p->log_pr);
+# --                 p.pr = player_pr(p)
+        $p->log_pr($p->player_log_pr);
+    }
+
+# --         for each game, g
+    foreach my $g (@games) {
+# --                 g.oldpo = g.po
+        $g->log_oldpo($g->log_po);
+# --                 g.po = game_po(g)
+        $g->log_po($g->game_log_po);
+    }
+# print "propose_ratings($delta) done:\n";
+}
+
+# -- revert_ratings(delta: Rating)
+# --      For a ratings change of 'delta', revert to prior ratings.
+# --
+sub revert_ratings {
+# -- revert_ratings(delta: Rating) === 
+    my ($delta) = @_;
+# --         for each player, p
+# print "revert_ratings($delta)\n";
+    foreach my $p (@players) {
+# --                 case p.direction
+# --                         UP:     p.rating -= delta
+# --                         DOWN:   p.rating += delta
+        if ($p->direction eq 'UP') {
+            $p->changeRating(-$delta);
+        } elsif ($p->direction eq 'DOWN') {
+            $p->changeRating($delta);
+        }
+# --                 p.pr = p.oldpr
+        $p->log_pr($p->log_oldpr);
+    }
+# --         for each game, g
+# --                 g.po = g.oldpo
+    foreach my $g (@games) {
+        $g->log_po($g->log_oldpo);
+    }
+# print "revert_ratings($delta) done\n";
+}
+
+
+# -- compute_pt(): Likelihood
+# --      Compute the likelihood of the combination of all current ratings
+# --      and the outcome of all games.
+# -- In practice, repeated multiplication of probabilities can lead to 
+# -- floating underflow.  It is preferable to use the logarithms of these
+# -- values and use addition instead of multiplication.  Indeed, the entire
+# -- algorithm can be rewritten to utilize logarithms of Likelihood values.
+# --
+sub compute_log_pt {
+# -- compute_pt(): Likelihood === 
+# --         pt: Likelihood = 1
+    my $pt = 0; # log 1.0;
+# --         for each player, p
+# print "compute_log_pt\n";
+    foreach my $p (@players) {
+# --                 pt *= p.pr
+        $pt += $p->log_pr;
+    }
+printf "players->log_pt is %f\n", $pt;
+
+    unless ($include_pr) {  # BUGBUG: should player_pr be included here *and* in the game_po's?
+        $pt = 0; # log 1.0; # start again for games
+    }
+# --         for each game, g
+    foreach my $g (@games) {
+# --                 pt *= g.po
+        $pt += $g->log_po;
+# printf("\$%s.vs.%s->po is %f\n", $g->white->id, $g->black->id, exp $g->log_po) if ($g->log_po < LOG_THRSH);
+    }
+# --         return pt
+print "compute_log_pt returns \$pt = $pt\n";
+    return $pt;
+}
+
+
+# --compute_player_impact(p: Player, delta: Rating): Number
+# --      Compute the ratio ptNew/pt, where 
+# --              pt is total likelihood given the current assignment of ratings 
+# --              and ptNew is the likelihood resulting from 
+# --              changing the rating for player 'p' by 'delta'.
+# --      If this value is greater than one, the new rating is more accurate.
+# --      The tests against BIG are because after four or five sd's, 
+# --      the estimated rating has zero likelihood.  Therefore we give
+# --      the likelihood a little slope back toward the seed to
+# --      minimize the possibility of a plateau in the search.
+# --
+sub compute_player_impact {
+    my ($p, $delta) = @_;
+# print "compute_player_impact(", $p->id, ", \$delta=$delta)\n";
+# -- compute_player_impact(p: Player, delta: Rating): Number ===
+# --         pfactor: Likelihood
+# --         r_save: Rating = p.rating
+    my $r_save = $p->rating;
+    my $s_save = $p->sigma;     # BUGBUG: save original sigma too
+# --         p.rating += delta       -- temporarily change rating (for game_po)
+    $p->changeRating($delta);
+# -- 
+# --         if  abs(p.rating - p.seed) / p.sigma > BIG
+    if (abs(($p->rating - $p->seed) / $p->sigma) > BIG) {
+# --                 -- player's rating is far from seed:  recompute sigma
+# --                 p.sigma = abs(p.rating - p.seed) / (BIG/2)
+        $p->sigma(abs($p->rating - $p->seed) / (BIG / 2));
+    }
+
+# --         pfactor = player_pr(p) / p.pr
+    my $log_pfactor = $p->player_log_pr - $p->log_pr;
+# --         for each game, g, that p has played
+    foreach my $g (@games) {
+# --                 pfactor *= game_po(g) / g.po
+        $log_pfactor += $g->game_log_po - $g->log_po;
+    }
+# -- 
+# --         p.rating = r_save
+    $p->rating($r_save);
+    $p->sigma($s_save) if ($restore_sigma);         # BUGBUG: restore sigma
+# --         return pfactor
+# print "compute_player_impact(", $p->id, ", \$delta=$delta) returns $log_pfactor\n";
+    return $log_pfactor;
+}
+
+# -- 
+# -- 
+# -- estimate_ratings(): Likelihood
+# --      Estimate ratings simultaneously for all players and games.
+# --      Returns pt, the likelihood of the outcome, given the new ratings.
+# --
+my $firstSeed = 1;
+
+sub estimate_ratings {
+# -- estimate_ratings(): Likelihood ===
+# -- 
+# --         prune_unrateable_players()
+# print "estimate_ratings\n";
+    prune_unrateable_players();
+# -- 
+    my $best_pt;
+# --         -- set ratings to seed values 
+# --         for each player, p
+    foreach my $p (@players) {
+# --                 p.rating = p.seed
+        $p->rating($p->{seed}) if($firstSeed);
+# --                 p.direction = NONE
+        $p->direction('NONE');
+    }
+    $firstSeed = 0;
+# -- 
+# --         -- calculate initial values of all pt components 
+# --         propose_ratings(0)              -- compute initial po and pr
+    propose_ratings(0);
+    # awl_correct;        # add fake games to all-wins and all-lose players
+# --         best_pt:Number = compute_pt()           -- compute resulting pt
+    $best_pt = exp compute_log_pt();
+#print "\$best_pt is $best_pt\n";
+# -- 
+# --         -- search for best new rating values 
+# --         delta: Number = max_delta
+    my $delta = MAX_DELTA;
+# --         while delta >= .002         -- ensure two decimal places of accuracy
+    while ($delta >= 0.002) {
+# --                 for each player, p
+print "try delta = $delta\n";
+        foreach my $p (@players) {
+# --                         -- decide whether rating should go up or down
+# --                         -- Note: Need to add code to deal with the case where
+# --                         --       p is removed within compute_player_impact
+# --                         chng_plus: Number  = compute_player_impact(p,  delta)
+            my $chng_plus = compute_player_impact($p, $delta);
+# --                         chng_minus: Number = compute_player_impact(p,  -delta)
+            my $chng_minus = compute_player_impact($p, -$delta);
+# --                         if chng_plus < 1 and chng_minus < 1 then
+            if (($chng_plus < 0) and ($chng_minus < 0)) {       # log 1 == 0
+# --                                 p.direction = NONE
+                $p->direction('NONE');
+                push(@{$track{$p->id}}, '-');
+# --                         else if chng_plus > chng_minus
+            } elsif ($chng_plus > $chng_minus) {
+# --                                 p.direction = UP
+                $p->direction('UP');
+                push(@{$track{$p->id}}, '^');
+# print $p->id . " UP $delta\n";
+# --                         else -- chng_minus > chng_plus
+            } elsif ($chng_minus > $chng_plus) {
+# --                                 p.direction = DOWN
+                $p->direction('DOWN');
+                push(@{$track{$p->id}}, 'v');
+# print $p->id . " DOWN $delta\n";
+            } else { # BUGBUG elsif ($chng_plus == $chng_minus) ?  is this possible?
+                carp("chng_plus == chng_minus not handled!\n");
+            }
+        }
+# -- 
+# --                 -- change ratings and repeat with same or smaller delta
+# --                 propose_ratings(delta)
+        propose_ratings($delta);
+# --                 new_pt: Number = compute_pt()
+        my $new_pt = exp compute_log_pt();
+print "\$delta = $delta, \$best_pt = $best_pt, \$new_pt = $new_pt:\n   ";
+# --                 if new_pt > best_pt + EPSILON
+        if ($new_pt > $best_pt + EPSILON) {
+# --                         best_pt = new_pt
+print "much better: accept and try again with same \$delta\n";
+            $best_pt = $new_pt;
+# --                         -- do next cycle with same delta
+# --                 else if new_pt >= best_pt
+        } elsif ($new_pt >= $best_pt) {
+# --                         -- pt is no worse, but not much better; decrease delta
+# --                         delta /= 2
+print "slightly better (or same): accept and try again with \$delta / 2\n";
+            $delta /= 2;
+            $best_pt = $new_pt; # BUGBUG: shouldn't we save a new best_pt now?
+# --                 else 
+        } else {
+# --                         -- pt is no better;  undo the change & decrease delta
+# --                         revert_ratings(delta)
+print "worse: revert and try again with \$delta / 2\n";
+            revert_ratings($delta);
+# --                         delta /= 2
+            $delta /= 2;
+        }
+    }
+# -- 
+# --         -- compute sigmas to be used for next ratings cycle
+# --         for each player, p
+  if (0) {
+    $psense = 1;  # turn off game bad probability reporting
+    foreach my $p (@players) {
+# --                 p.sigma = player_sensitivity(p)
+        $p->sigma($p->player_sensitivity);
+    }
+    $psense = 0;
+  }
+# -- 
+# --         return pt
+# print "estimate_ratings returns \$best_pt = $best_pt\n";
+    return $best_pt;    # BUGBUG: best_pt, not pt
+}
+#
+# This is the end Fred Hansen's pseudo-code.
+#
+
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-rs>
+
+Restore sigma after making proposed changes in compute_player_impact.
+
+Default: sigma is not restored
+
+=item B<-no_pr>
+
+Do not include player PRs in total probablility (only game POs).
+
+Default: player PRs are included
+
+=item B<-no_wlc>
+
+Do not perform all-wins and all-losses correction.  Correction for players who
+have all wins or all losses is done by adding a 'fake' game with slightly
+lower probability than his least likely game, and then make the result the
+opposite (ie: a loss for an all-wins player and a win for an all-losses
+player).
+
+Correction is never done on round 1 since everyone is an all-wins or
+all-losses player after round 1.
+
+Default: correction is done if round > 1
+
+=item B<-init> filename
+
+Read in a previous ratings file (output from a previous rats run) and use the
+modified ratings instead of the ratings from the register.tde file.
+
+Default: ratings are taken from register.tde
+
+=item B<round_number>
+
+A number by itself (no minus sign) is taken as the round to calculate ratings
+for.
+
+Default: rats calculates new ratings from all available result files (1.tde,
+2.tde, etc).  Games with no result are not included.
+
+=back
+
+=cut
+
+my ($round, $initFilename);
+
+while (@ARGV) {
+    my $arg = shift;
+    if ($arg eq '-rs') {
+        $restore_sigma = 1
+    } elsif ($arg eq '-no_pr') {
+        $include_pr = 0
+    } elsif ($arg eq '-no_wlc') {
+        $awl_correction = 0;
+    } elsif ($arg eq '-init') {
+        $initFilename = shift;
+        die "Please give a filename for -init option" unless(defined($initFilename));
+    } elsif ($arg =~ m/\D/) {
+        die "I don't understand option $arg\n";
+    } else {
+        $round = $arg;
+    }
+}
+
+# create agaTourn, read register.tde and all round files
+if (defined($round)) {
+    $round =~ s/\.tde$//i;
+    $agaTourn = Games::Go::AGATourn->new(Round => 0);
+    for (my $ii = 1; $ii <= $round; $ii++) {
+        $agaTourn->ReadRoundFile($ii);
+    }
+} else {
+    $agaTourn = Games::Go::AGATourn->new;
+    $round =$agaTourn->Round;
+}
+
+$awl_correction = 0 if ($round <= 1);
+if (defined($initFilename)) {
+    my $inFp = IO::File->new("<$initFilename") or die "can't open $initFilename for reading: $!\n";
+    while (<$inFp>) {
+        # USA2172         Watanabe, Makoto:  -5.633 (  4.500 -->  -3.133)
+        next unless(m/^(\S*).*\(.* \-\->\s+([\d\.\-]+)\)/);
+        my ($id, $newRat) = ($1, $2);
+        $agaTourn->Rating($id, $newRat);
+    }
+    close $inFp;
+}
+$evenKomi = 7 if (defined($agaTourn->Directive('RULES')) and
+                    (uc($agaTourn->Directive('RULES')->[0]) eq 'ING'));
+my $outFp = IO::File->new(">rats_$round.txt") or die "can't open rats_$round.txt for writing: $!\n";
+my $id;
+# create an array of player objects (no games attached yet)
+foreach my $id (keys %{$agaTourn->Rating}) {
+    # create a new player from the ID and ratings
+    my $p = Player->new(id        => $id,
+                        AGAseed   => $agaTourn->Rating($id),
+                        sigma     => $agaTourn->Sigma($id));
+    $IDtoPlayer{$id} = $p;  # record in ID to player conversion hash
+    push(@players, $p);     # and make a list of players
+}
+{
+    my %IDtoGames;
+    foreach my $g (@{$agaTourn->GamesList}) {
+        my ($whiteID, $blackID, $result,
+            $handicap, $komi, $round) = split(',', $g);
+        my $whitewins;
+        if (lc($result) eq 'w') {
+            $whitewins = 1;
+        } elsif (lc($result) eq 'b') {
+            $whitewins = 0;
+        } else {
+            next;       # no result?  skip it
+        }
+        my $game = Game->new(white     => $IDtoPlayer{$whiteID},
+                             black     => $IDtoPlayer{$blackID},
+                             whitewins => $whitewins,
+                             komi      => $komi,
+                             evenkomi  => $evenKomi,
+                             handicap  => $handicap);
+        push(@{$IDtoGames{$whiteID}}, $game); # save game in both players' lists
+        push(@{$IDtoGames{$blackID}}, $game);
+        push(@games, $game);                    # and make a list of games
+    }
+    # attach game lists to players
+    foreach my $id (keys(%IDtoGames)) {
+        my $p = $IDtoPlayer{$id};
+        $p->games($IDtoGames{$id});
+    }
+}
+
+# finally, we're ready to go to work:
+my $pt = estimate_ratings();
+if ($awl_correction) {
+    awl_correct;                # add fake games to all-wins and all-lose players
+    foreach (keys(%track)) {
+        push(@{$track{$_}}, ' ');
+    }
+    $pt = estimate_ratings();   # and re-calculate ratings
+}
+
+print ($outFp "\n\ntotal probablility = $pt\n");
+print (       "\n\ntotal probablility = $pt\n");
+
+# print all game probabilities
+foreach my $g (sort { $b->log_po <=> $a->log_po } @games) {
+    my $vs = $g->{whitewins} ? '+vs-' : '-vs+';
+    my $msg = sprintf "\$po = %5.5f: %s(% 7.3f->% 7.3f)$vs%s(% 7.3f->% 7.3f)\n", exp $g->log_po,
+                        $g->{white}->id, $g->{white}->AGAseed ,$g->{white}->AGArating,
+                        $g->{black}->id, $g->{black}->AGAseed, $g->{black}->AGArating;
+    print $outFp $msg;
+    print        $msg;
+}
+
+print "\n";
+
+# print all changes to players ratings
+my %changes;
+foreach my $p (@players) {
+    my $diff = $p->rating - $p->seed;
+    # next if(abs($diff) < 0.01);
+    $changes{$p->{id}} = $diff;
+}
+my $names = $agaTourn->Name;
+my $nl = $agaTourn->NameLength;
+foreach my $id (sort {$changes{$b} <=> $changes{$a}} keys(%changes)) {
+    my $p = $IDtoPlayer{$id};
+    printf $outFp "%-8s %*s: % 7.3f (% 7.3f --> % 7.3f)  ", $id, $nl, $names->{$id},
+                            $changes{$id}, $p->AGAseed, $p->AGArating;
+    print $outFp @{$track{$id}};
+    print $outFp "\n";
+    printf        "%-8s %*s: % 7.3f (% 7.3f --> % 7.3f)  ", $id, $nl, $names->{$id},
+                            $changes{$id}, $p->AGAseed, $p->AGArating;
+    print        @{$track{$id}};
+    print        "\n";
+}
+
+__END__
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o around(1)   - pair a tournament round
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tscore(1)   - score a tournament
+
+=item o send2AGA(1) - prepare tournament result for sending to AGA
+
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

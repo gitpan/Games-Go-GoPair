@@ -1,0 +1,18 @@
+MANIFEST                        this file
+README                          quick introduction to this package, including installation
+Changes                         change history (such as it is...)
+Makefile.PL                     source for MakeMaker (run "perl Makefile.PL" to build this package)
+tdfind                          perl/Tk script TDLIST finder for preparing register.tde file
+aradjust                        perl/Tk script for tournament result adjustments
+tpairs                          script to format pairs listing from AGA format files
+randresult                      script to generate random tournament results
+rats                            script to calculate ratings adjustments
+gopair                          script to generate go tournament pairings
+tscore                          script to calculate the tournament result (score)
+send2aga                        script to generate final results to send to AGA
+Erf.pm                          copy of error function module from Math::SpecFun
+TDEntry.pm                      perl/Tk widget entry support for TDFinder widget
+TDFinder.pm                     perl/Tk widget support for tdfind script
+t/Games-Go-AGA-TDEntry.t        tests for TDEntry
+t/Games-Go-AGA-TDFinder.t       tests for TDFinder
+META.yml                        Module meta-data (added by MakeMaker)

@@ -1,0 +1,360 @@
+#!/usr/bin/perl -w
+
+#   tdfind: find players in TDLIST and enter them into
+#               an appropriate .tde file.  The most recent
+#               TDLIST is available from the AGA at:
+#                       http:www.usgo.org
+#   Copyright (C) 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT
+#   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+#   FITNESS FOR A PARTICULAR PURPOSE.
+#
+
+#
+# ToDo:
+#       use $text->editModified()?
+#
+
+use Tk;
+use Tk::widgets qw/ Dialog  ErrorDialog /;
+use Games::Go::AGATourn;
+use Games::Go::TDFinder;
+use IO::File;
+use File::stat;         # stat fields by name
+
+my $tdeFile = 'register.tde';   # default TDE file
+my $tdListFile = 'tdlist';      # default tdlist file
+my $tdeMtime = 0;
+my $tdeChanges = -1;
+my $tdeRedo = -1;
+my $mw;
+my $tdFind;
+my $checkFileUpdate = 0;    # to prevent recursion
+
+
+sub Usage {
+    print("Usage: tdfind [ options ]\n",
+          "   options:\n",
+          "      [ -tde tde_filename]        filename to use in place of register.tde\n",
+          "      [ -tdlist tdlist_filename]  filename/path for TDLIST\n",
+          );
+}
+
+sub myExit {
+    my ($mw, $tdeText, $tdeFile) = @_;
+
+    $tdFind->sort();            # one final sort
+    # print "\$tdeText->numberChanges = ", $tdeText->numberChanges, "\n";
+    # print "\$tdeChanges = $tdeChanges\n";
+    # print "\$tdeText->SizeRedo = ", $tdeText->SizeRedo, "\n";
+    # print "\$tdeRedo = $tdeRedo\n";
+    if (($tdeText->numberChanges != $tdeChanges) or # save if there have been changes
+        ($tdeText->SizeRedo != $tdeRedo)) {
+        my $b_saveq   = 'Save and Quit';
+        my $b_saveas  = 'Save as ... and Quit',
+        my $b_qnosave = 'Quit without saving';
+        my $b_cancel  = 'Cancel';
+        my $rsp = $mw->Dialog(
+            -text => "$tdeFile has unsaved changes:",
+            -default_button => $b_saveq,
+            -buttons => [$b_saveq,
+                         $b_saveas,
+                         $b_qnosave,
+                         $b_cancel]
+            )->Show;
+        if ($rsp eq $b_saveq) {
+            &Tk::exit(0) if saveTde($tdeText, $tdeFile);
+        } elsif ($rsp eq $b_saveas) {
+            &Tk::exit(0) if saveAs($mw, $tdeText);
+        } elsif ($rsp eq $b_qnosave) {
+            &Tk::exit(1);
+        } elsif ($rsp eq $b_cancel) {
+            return;
+        } else {
+            $tdeText->Error("Unexpected response in myExit: $rsp");
+        }
+    } else {
+        &Tk::exit(0);
+    }
+}
+
+# save, but first check to see if the on-disk file has changed.
+sub save {
+    my ($mw, $tdeText, $tdeFile) = @_;
+
+    return if ($checkFileUpdate);       # prevent recursion
+    # print "checkFileUpdate save = $checkFileUpdate\n";
+    if (stat($tdeFile)->mtime == $tdeMtime) {       # no changes?
+        return 1 unless ($tdeText->numberChanges);  # no save if no changes
+        return saveTde($tdeText, $tdeFile);
+    }
+    my $b_saveas = 'Save as ...';
+    my $b_wrovr  = "Write over $tdeFile";
+    my $b_read   = "Read $tdeFile (discard changes)",
+    my $b_cancel = 'Cancel (do nothing)';
+    my $rsp = $mw->Dialog(
+        -text => "$tdeFile has changed since last load:",
+        -buttons => [$b_saveas,
+                     $b_wrovr,
+                     $b_read,
+                     $b_cancel],
+        -default_button => $b_saveas,
+        )->Show;
+    if ($rsp eq $b_saveas) {
+        return saveAs($mw, $tdeText);
+    } elsif ($rsp eq $b_wrovr) {
+        return saveTde($tdeText, $tdeFile);
+    } elsif ($rsp eq $b_read) {
+        readTde($tdeText, $tdeFile);
+        return 0;
+    } elsif ($rsp eq $b_cancel) {
+        # nothing
+    } else {
+        Tk::Error("Unexpected response in save: $rsp");
+    }
+    return 0;
+}
+
+sub saveAs {
+    my ($mw, $tdeText) = @_;
+
+    my $fname = $mw->getSaveFile(
+        -defaultextension => '.tde',
+        -filetypes => [ [ 'TDE files', ['.tde', '.TDE'] ] ],
+        );
+    if (defined ($fname)) {
+        saveTde($tdeText, $fname);
+    }
+}
+
+# unconditional save of data in $tdeText to filename $tdeFile
+sub saveTde {
+    my ($tdeText, $tdeFile) = @_;
+
+    my $saveTde = IO::File->new(">$tdeFile") or die "can't open $tdeFile for writing: $!";
+    my $tde = $tdeText->get('1.0', 'end');
+    $tde =~ s/\n\n$/\n/s;       # Text widget adds an annoying extra LF at the end
+    $saveTde->print($tde);
+    $saveTde->close;
+    eval { $tdeMtime = stat($tdeFile)->mtime } or $tdeText->Error("$tdeFile: $!");
+    $tdeChanges = $tdeText->numberChanges;
+    $tdeRedo = $tdeText->SizeRedo;
+    my $players = 0;
+    foreach (split("\n", $tde)) {
+        $players++ if (m/^[^#\s]/);
+    }
+    $mw->title("tdfind: $players registered");
+    return 1;
+}
+
+my $agaTourn = Games::Go::AGATourn->new(register_tde => undef,
+                                             Round        => 0);
+sub readTde {
+    my ($tdeText, $tdeFile) = @_;
+
+    my $readTde = IO::File->new("<$tdeFile") or die "can't open $tdeFile for reading: $!";
+    $tdFind->clear;
+    my ($line, $l);
+    my $players = 0;
+    while ($l = $line = <$readTde>) {
+        $l =~ s/\s*$//;         # delete all trailing whitespace
+        $l =~ s/\s*#.*//s;
+        if ($l ne '') {
+            $tdFind->addTDE($line);
+            $players++;
+        } else {
+            $line =~ s/\r//gs;
+            # print "insert comment at end: $line";
+            $tdeText->insert('end', $line);        # insert comments as they are
+        }
+    }
+     $readTde->close;
+    $tdFind->sort();
+    $tdFind->addPlayer(undef);  # this un-marks the most recent insertion
+    eval { $tdeMtime = stat($tdeFile)->mtime } or $tdeText->Error("$tdeFile: $!");
+    $tdeChanges = $tdeText->numberChanges;
+    $tdeRedo = $tdeText->SizeRedo;
+    $mw->title("tdfind: $players registered");
+}
+
+sub checkFileUpdated {
+    my ($mw, $tdeText, $tdeFile) = @_;
+
+    return if ($checkFileUpdate);       # prevent recursion
+    # print "mtime = ", stat($tdeFile)->mtime, ", ";
+    # print "tdeMtime = $tdeMtime\n";
+    return if (stat($tdeFile)->mtime == $tdeMtime);     # no changes?
+    $checkFileUpdate = 1;
+    # print "checkFileUpdate on = $checkFileUpdate\n";
+    my $b_read  = "Read $tdeFile (discard changes in window)";
+    my $b_wrovr = "Write over $tdeFile (discard file)";
+    my $rsp = $mw->Dialog(
+        -text   => "$tdeFile has changed since last load:",
+        -buttons => [$b_read,
+                    $b_wrovr],
+        -default_button => $b_read,
+        )->Show;
+    if ($rsp eq $b_read) {
+        readTde($tdeText, $tdeFile);
+    } elsif ($rsp eq $b_wrovr) {
+        saveTde($tdeText, $tdeFile);
+    } else {
+        Tk::Error("Unexpected response in checkFileUpdated: $rsp");
+    }
+    $checkFileUpdate = 0;
+    # print "checkFileUpdate off = $checkFileUpdate\n";
+}
+
+my $help = q"
+Type search keys into 'Search:' field at the bottom.  Multiple search keys can be seperated by spaces. Keys should probably have at least two characters and may be full regular expressions if needed (partial or illegal regular expressions cause the background.
+
+Up and down arrows select matched items.  Shift-Up and Shift-Down adjust the rank for the selected match item.  'Enter' adds the selected match item to the .tde file.  'ESC' clears the Search: field.
+";
+
+sub ShowHelp {
+    my ($mw) = @_;
+
+    my $hw = $mw->Toplevel(-title => 'tdfind Help');      # create top level help window
+    my $ht = $hw->Scrolled(
+        'ROText',
+        -wrap   => 'word',
+        -exportselection => 'true',
+        -scrollbars => 'osow',
+        )->pack(
+            -expand => 'true',
+            -fill   => 'both',
+            );
+    $ht->insert('1.0', $help);
+}
+
+# here's where things really happen
+
+# parse command line
+while (@ARGV) {
+    my $arg = shift(@ARGV);
+    if ($arg eq '-tde') {
+        $tdeFile = shift(@ARGV);
+        die ("Please provide a .tde filename with the -tde option\n") unless(defined($tdeFile));
+    } elsif ($arg eq '-tdlist') {
+        $tdListFile = shift(@ARGV);
+        die ("Please provide a TDLIST filename with the -tdlist option\n") unless(defined($tdListFile));
+    } else {
+        die ("Sorry, I don't understand '$arg'\n");
+    }
+}
+
+$mw = MainWindow->new();
+$tdFind = $mw->TDFinder(tdListFile => $tdListFile);
+$tdFind->pack(-expand => 'true',
+                -fill => 'both');
+my $entry = $tdFind->Subwidget('entry');
+$entry->focus();         # start with focus in the entry widget
+# $entry->grab();         # keep focus in the entry widget
+my $tdeText = $tdFind->Subwidget('tdeText');
+
+my $menu = $tdeText->menu();
+$menu->add('command',
+            -command     => [ \&ShowHelp, $mw ],
+            -label       => 'Help',
+            -underline   => 0,
+            -accelerator => 'Cntrl-h');
+$mw->bind('<<Change>>', [ \&save, $tdeText, $tdeFile ]);        # bind adds $mw as first arg
+$mw->bind('<Control-h>', [ \&ShowHelp ]);
+$tdeText->bind('<FocusOut>', [ \&save, $tdeText, $tdeFile ]);
+$entry->bind('<FocusIn>', [ \&checkFileUpdated, $tdeText, $tdeFile ]);
+
+$mw->protocol('WM_DELETE_WINDOW', [ \&myExit, $mw, $tdeText, $tdeFile ]);
+
+if (-f $tdeFile) {
+    readTde($tdeText, $tdeFile);
+} else {
+    my $createTde = IO::File->new(">$tdeFile") or die "can't create $tdeFile: $!";
+    $createTde->close;
+}
+eval { $tdeMtime = stat($tdeFile)->mtime } or die "$tdeFile: $!";
+
+$mw->MainLoop();               # process window requests forever
+
+
+__END__
+
+=head1 NAME
+
+tdfind - finds Go players in TDLIST and enters them into register.tde
+
+=head1 SYNOPSIS
+
+tdfind [ -r register.tde ] [ -tdlist tdlist_file ] [ -tde tde_file ]
+
+=head1 DESCRIPTION
+
+Prepare a Go Tournament register.tde file in American Go Association (AGA) format by finding
+players entries in the (AGA provided) TDLIST.
+
+Note: shortly before the tournament, tournament directors should download
+the most recent TDLIST from the AGA home page at L<www.usgo.org>.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-tde> filename
+
+Name for register.tde file.
+
+Default: 'register.tde'
+
+=item B<-tdlist> filename
+
+Name for TDLIST file (from the AGA).
+
+Default: 'tdlist'
+
+=back
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o around(1)   - pair a tournament round
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tpairs(1)   - convert pairings from AGA format to printable
+
+=item o tscore(1)   - score a tournament
+
+
+=item o send2AGA(1) - prepare tournament result for sending to AGA
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=item o Games::Go::TDEntry(3)  - perl/Tk widget support for TDFinder
+
+=item o Games::Go::TDFinder(3) - perl/Tk tdfind support widgets
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

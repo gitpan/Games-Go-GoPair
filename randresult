@@ -1,0 +1,196 @@
+#!/usr/local/bin/perl -w
+# $Id: randresult,v 1.6 2005/01/05 22:58:44 reid Exp $
+
+#   randresult - perl script to assign random results to 
+#                a .tde file created by accelrat
+
+#   Copyright (C) 1995, 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT
+#   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+#   FITNESS FOR A PARTICULAR PURPOSE.
+#
+
+
+use strict;
+require 5.001;
+use IO::File;
+
+my $myName = $0;             # full pathname of this file
+$myName =~ s".*/"";          # delete any preceding path
+
+sub Usage {
+    print("\nUsage: $myName [-f] [-r] filename      assign weighted random results\n",
+          "                                          to filename. -r makes 50% chances.\n");
+}
+
+my $force = 0;
+my $weight = 1;
+my $inFileName = '';
+my ($infp, $outfp);
+
+my $ii;
+
+for ($ii = 0; $ii < @ARGV; $ii++) {
+    if ($ARGV[$ii] eq '-h') {
+        Usage();
+        exit(0);
+    } elsif ($ARGV[$ii] eq '-r') {
+        $weight = 0;
+    } elsif ($ARGV[$ii] eq '-f') {
+        $force = 1;
+    } else {
+        $inFileName = $ARGV[$ii];
+    }
+}
+
+if ($inFileName eq '') {
+    for ($inFileName = 1; -f "$inFileName.tde"; $inFileName++) {}
+    $inFileName--;
+    RandomResult("$inFileName.tde");
+} else {
+    if (-f $inFileName) {
+        RandomResult($inFileName);
+    } else {
+        RandomResult("$inFileName.tde");
+    }
+}
+
+sub RandomResult {
+    my ($fName) = @_;
+
+    $infp = IO::File->new("<$fName") or die ("Error opening $fName for reading\n");
+
+    $outfp = IO::File->new(">foo.tmp") or die("Error opening foo.tmp for writing\n");
+
+    my ($idW, $idB, $win, $handi, $komi,
+        $whiteName, $realWhiteRank, $whiteRank,
+        $blackName, $realBlackRank, $blackRank);
+    my ($prob, $toss);
+
+
+    while(<$infp>) {
+        s/[\n\r]//g;
+        unless
+        (m/^\s*([\d\w]+)\s+([\d\w]+)\s+(\?)\s+(\d+)\s+([-\d]+)\s*#[^[A-Z]*(\w.*?\d\.\d).*?(\d\.\d.*?)\s*$/) {
+            print $outfp "$_\n";
+            next;
+        }
+        $idW = $1;
+        $idB = $2;
+        $win = $3;
+        $handi = $4;
+        $komi = $5;
+        $whiteName = $6;
+        $blackName = $7;
+        if ($whiteName =~ s/\s*\(\d+\)\s*([-1-9][0-9]*\.[0-9]*)\s*$//) {
+            $realWhiteRank = $whiteRank = $1;
+        }
+        if ($blackName =~ s/\s*([-1-9][0-9]*\.[0-9]*)\s*\(\d+\)\s*//) {
+            $realBlackRank = $blackRank = $1;
+        }
+        if ($weight) {
+            if ($whiteName =~ m/\((\d\.\d)\)/) {
+                $realWhiteRank = $1;
+            }
+            if ($blackName =~ m/\((\d\.\d)\)/) {
+                $realBlackRank = $1;
+            }
+            $prob = ($realWhiteRank - $realBlackRank) / 2;  # rank diff of 2 = 100%, diff of 0 = 50%
+        } else {
+            $prob = 0;              # assign 50% probability
+        }
+        # Note: $prob is not actually a probability.  it runs from -1 to +1.
+#    my ($ii, $whiteWins);
+#    $whiteWins = 0;
+#    for ($ii = 0; $ii < 1000; $ii++) {
+#        $toss = rand(2) - 1;
+#        $win = ($toss < $prob) ? 'w' : 'b';     # assign white or black win
+#        if ($win eq 'w') {
+#            $whiteWins++;
+#        }
+#    }
+#    print("$whiteName vs $blackName, prob = $prob, white won $whiteWins times\n");
+        $toss = rand(2) - 1;
+        $win = ($toss < $prob) ? 'w' : 'b';     # assign white or black win
+        printf $outfp "%7s %7s %1s %1s %2s # %21s %4s : %4s %-21s\n",
+                    $idW, $idB, $win, $handi, $komi, $whiteName, $whiteRank, $blackRank, $blackName;
+    }
+
+    close($infp);
+    close($outfp);
+    system ("mv foo.tmp $fName");
+}
+
+__END__
+
+=head1 NAME
+
+randresult - enter random results (winners/losers) in an AGA round (B<for testing only!>)
+
+=head1 SYNOPSIS
+
+randresult [ round_number ]
+
+=head1 DESCRIPTION
+
+randresult is useful to test running an American Go Association (AGA) tournament.  It randomly
+assigns winners and losers to a tournament round.  B<Not for use while running a tournament
+normally - for testing only!>
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<round_number>
+
+The default is to adjust the current round (based on the last n.tde file).  Previous rounds can
+be adjusted by providing the round number as a command line argument.
+
+=back
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o around(1)   - pair a tournament round
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tpairs(1)   - convert pairings from AGA format to printable
+
+=item o tscore(1)   - score a tournament
+
+=item o send2AGA(1) - prepare tournament result for sending to AGA
+
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=item o Games::Go::TDEntry(3)  - perl/Tk widget support for TDFinder
+
+=item o Games::Go::TDFinder(3) - perl/Tk tdfind support widgets
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 1995, 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

@@ -1,0 +1,1334 @@
+#!/usr/local/bin/perl -w
+# $Id: aradjust,v 1.32 2005/01/24 03:11:09 reid Exp $
+
+#   aradjust: adjust Accelrat 2.5.1 pairings
+#   Copyright (C) 1999, 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT
+#   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+#   FITNESS FOR A PARTICULAR PURPOSE.
+#
+
+
+#
+# ToDo:
+#       add support for adding dummy and single players to register.tde?
+#
+
+
+use strict;
+require 5.001;
+
+BEGIN {
+    our $VERSION = sprintf "%d.%03d", '$Revision: 1.32 $' =~ /(\d+)/g;
+}
+
+package TextBox;        # make ROText dialog box for Help and About windows
+
+use Tk;
+use Tk::widgets qw(DialogBox ROText);
+
+use base qw(Tk::Toplevel Tk::DialogBox); # TextBox is composite widget
+
+Construct Tk::Widget 'TextBox';
+
+######################################################
+#
+#       methods
+#
+#####################################################
+
+sub InitObject {
+    my ($self, $args) = @_;
+
+    $self->SUPER::InitObject($args);
+    $self->{text} = $self->Scrolled('ROText',
+                                    '-scrollbars' => 'osow',
+                                    '-wrap' => 'word');
+    $self->{text}->pack('-side' => 'top',
+                        '-fill' => 'both');
+    $self->ConfigSpecs(
+        '-text'     => ['METHOD', 'text',     'Text',      '' ],
+        DEFAULT  => [$self->{text}],);
+
+    return($self);
+}
+
+sub text {
+    my ($self, $text) = @_;
+    $self->{text}->configure('-state' => 'normal');
+    $self->{text}->insert('insert', $text);
+    $self->{text}->configure('-state' => 'disabled');
+}
+
+package Tk::ArAdj;
+
+use IO::File;
+use Tk;
+use Tk::widgets qw(FileSelect Dialog ROText ErrorDialog);
+use Tk qw(Ev);
+use Games::Go::AGATourn;   # stuff to parse AGA tournament data files
+
+use base qw(Tk::Frame);         # composite widget
+
+Construct Tk::Widget 'ArAdj';
+
+######################################################
+#
+#       class variables
+#
+#####################################################
+
+my $selectBg  = '#ffffe8';      # 255 255 224 = light yellow
+my $hkGood    = '#90ee90';      # 144 238 144 = light green
+my $hkGuess   = '#add8e6';      # 173 216 230 = light blue
+my $hkBad     = '#ffb6c1';      # 255 182 193 = light pink
+my $alreadyBg = '#f0f0c0';      # 240 240 230 = less light yellow
+
+######################################################
+#
+#       methods
+#
+#####################################################
+
+sub Populate {
+    my ($self, $args) = @_;
+
+    $self->SUPER::Populate($args);
+
+    $self->ConfigSpecs(
+        '-filename'    => ['PASSIVE', 'filename',    'FileName',    'file name not set' ],
+        '-format_only' => ['PASSIVE', 'format_only', 'Format_only', 0 ],
+        DEFAULT        => [$self->{text}                    ],);
+
+    my $frame = $self->Frame('-bg' => 'blue');
+    $frame->pack('-expand' => 'true', '-fill' => 'both');
+    my $t = $self->{text} = $frame->Scrolled('ROText',
+        '-scrollbars' => 'osow',  # scrollbars left and bottom if needed
+        '-wrap'       => 'none');  # don't wrap text
+    $t->pack(
+        '-side'   => 'bottom',
+        '-expand' => 'true',
+        '-fill'   => 'both');
+    my $bbar = $frame->Frame();                 # put a button-bar along the top
+    $self->PopulateBBar($bbar);                 # set up the buttons
+    $bbar->pack('-side' => 'top',
+                '-fill' => 'x');
+    $t->tagConfigure("header",
+        '-background' => 'lightgrey',
+        '-relief' => 'raised',
+        '-underline' => 'true');
+    $t->tagConfigure("win",
+        '-foreground' => 'blue',
+        '-underline' => 'true');
+    $t->tagConfigure("lose",
+        '-foreground' => 'darkblue');
+    my $sw = $t->Subwidget('scrolled');         # get the scrolled widget
+    $sw->bindtags([$sw, ref $sw, $sw->toplevel, 'all']);    # re-order bindings so our subs are called first
+    foreach(qw(w W b B x X)) {
+        $sw->bind("<$_>", [$self => 'ChangeResult', $_]);
+    }
+    $sw->bind('<Key question>', [$self => 'ChangeResult', 'x']);
+    $sw->bind('<Key slash>',    [$self => 'ChangeResult', 'X']);
+    $sw->bind('<plus>',         [$self => 'AdjustValue', 1]);
+    $sw->bind('<KP_Add>',       [$self => 'AdjustValue', 1]);
+    $sw->bind('<minus>',        [$self => 'AdjustValue', -1]);
+    $sw->bind('<KP_Subtract>',  [$self => 'AdjustValue', -1]);
+    $sw->bind('<Up>',           [$self => 'Button1', undef, 'up']);
+    $sw->bind('<Down>',         [$self => 'Button1', undef, 'down']);
+    $sw->bind('<Left>',         [$self => 'Button1', undef, 'left']);
+    $sw->bind('<Right>',        [$self => 'Button1', undef, 'right']);
+    $self->{lines} = 0;
+    $self->Clear();
+    unless (exists($args->{'-format_only'}) and
+            $args->{'-format_only'}) {
+        $self->afterIdle(sub { $self->Open($self->cget('-filename')); });
+    }
+    $self->afterIdle( sub { $self->{normalBackground} = $t->cget('-background'); } );
+    return($self);
+}
+
+sub ClassInit {
+    my ($class, $self) = @_;
+
+    return($class->SUPER::ClassInit($self));
+}
+
+sub PopulateBBar {
+    my ($self, $bbar) = @_;
+
+    my ($b, $m);        # temporary button and menu variables
+    my %menubuttonStyle = ('-borderwidth' => 3, '-relief' => 'groove');
+    my %buttonStyle = ('-borderwidth' => 3, '-relief' => 'sunken');
+    # a "File" button
+    $b = $bbar->Menubutton('-text' => 'File', %menubuttonStyle);
+    my $menu = $b->Menu();
+    $b->configure('-menu' => $menu);
+    $menu->configure('-postcommand' => [$self => 'MakeFileMenu', $menu]);
+    $b->pack('-side' => "left");
+
+    # the Undo menubutton
+    $b = $bbar->Button('-text' => 'Undo', '-command' => [$self => 'Backward'], %buttonStyle);
+    $b->pack('-side' => 'left');
+    $b->configure('-state' => 'disabled');
+    $self->{undoButton} = $b;
+
+    # the Redo menubutton
+    $b = $bbar->Button('-text' => 'Redo', '-command' => [$self => 'Forward'], %buttonStyle);
+    $b->pack('-side' => 'left');
+    $b->configure('-state' => 'disabled');
+    $self->{redoButton} = $b;
+
+    # the Help button
+    $b = $bbar->Menubutton('-text' => 'Help', %menubuttonStyle, '-menuitems'  => [
+            ['Button' => 'Help...',      '-command' => [$self => 'Help', 'Help']],
+            ['Button' => 'Bindings...',  '-command' => [$self => 'Help', 'Bindings']],
+            ['Button' => 'Tourney...',   '-command' => [$self => 'Help', 'Tourney']],
+            ['Button' => 'About...',     '-command' => [$self => 'Help', 'About']],
+        ]);
+    $b->pack('-side' => 'right');
+
+    # the Save/Quit button
+    $b = $bbar->Button('-text' => 'Save/Quit',
+                       '-command' => [$self => 'SaveQuit'],
+                       %buttonStyle);
+    $b->pack('-side' => 'right');
+
+    if(defined($DB::single)) {  # debug stuff
+        # a Test button
+#        $b = $bbar->Button('-text' => 'Test', '-command' => [$self => 'Test'], %menubuttonStyle);
+#        $b->pack('-side' => "right");
+
+        # a Debug button
+        $b = $bbar->Button('-text' => 'Debug',
+                           '-command' => ['Debug' => $self],
+                           '-underline' => 3,
+                           %buttonStyle);
+        $self->bind('<Control-u>' => [$self => 'Debug']);
+        $b->pack('-side' => "right");
+    }
+}
+
+sub MakeFileMenu {
+    my ($self, $menu) = @_;
+
+    $menu->delete(0, 'end');                    # delete all menu entries
+    $menu->add('command', '-label' => 'Open...',   '-command' => [$self => 'Open']);
+    $menu->add('command', '-label' => 'Save',      '-command' => [$self => 'Save']);
+    $menu->add('command', '-label' => 'Save/Quit', '-command' => [$self => 'SaveQuit']);
+    $menu->add('command', '-label' => 'SaveAs...', '-command' => [$self => 'SaveAs']);
+    $menu->add('separator');
+    my ($round);
+    for ($round = 1; -f "$round.tde"; $round++) {
+        $menu->add('command',
+                   '-label' => "Round $round",
+                   '-command' => [$self => 'Open', "$round.tde"]);
+    }
+    if ($round > 1) {
+        $menu->add('separator');     # if there were any rounds, add another seperator
+    }
+    $menu->add('command',
+               '-label' => 'Re-Pair this Round',
+               '-command' => [$self => 'RunPairings', 0]);
+    $menu->add('command',
+               '-label' => 'Pair Next Round',
+               '-command' => [$self => 'RunPairings', 1]);
+    $menu->add('separator');
+    $menu->add('command',
+               '-label' => 'Quit',
+               '-command' => [$self => 'Quit']);
+}
+
+sub Debug {
+    my ($self) = @_;
+
+    $DB::single = 1;
+    $DB::single = 0;
+}
+
+sub Quit {
+    my ($self) = @_;
+
+    return if ($self->SaveQuery() eq 'Abort');
+    exit;
+}
+
+sub Open {
+    my ($self, $filename) = @_;
+
+    unless(exists($self->{fileSelector})) {
+        $self->{fileSelector} = $self->toplevel()->FileSelect('-filter' => "*.tde");
+    }
+    my ($response, $error);
+    for ( ; ; ) {
+        $filename = $self->{fileSelector}->Show() unless(defined($filename));
+        return if (!defined($filename) or ($filename eq ''));
+        if (-f $filename) {
+            return unless($self->Read($filename));
+            $error = "error in Read";
+        } else {
+            $error = "$filename doesn't exist.",
+        }
+        $response = $self->toplevel->Dialog('-title'   => "File Error!",
+                                            '-text'    => $error,
+                                            '-buttons' => ['Cancel', 'Try again']) ->Show();
+        return unless ($response eq 'Try again');
+        $filename = undef;
+    }
+    $self->Button1_noBreak(undef, 'none');
+}
+
+sub SaveQuery {
+    my ($self) = @_;
+
+    return('') unless ($self->{histIdx} > $self->{saveIdx});
+    my $rsp = $self->toplevel->Dialog('-title'   => "Changes Pending!",
+                                      '-text'    => "You have made changes.  Save them now?",
+                                      '-buttons' => ['Save now',
+                                                     'SaveAs...',
+                                                     'Throw away changes',
+                                                     'Abort']) ->Show();
+    if ($rsp eq 'Save now') {
+        $self->Save($self->cget('-filename'));
+    } elsif ($rsp eq 'SaveAs...') {
+        $self->SaveAs();
+    }
+    return($rsp);       # caller should check for 'Abort'
+}
+
+sub SaveAs {
+    my ($self) = @_;
+
+    unless(exists($self->{fileSelector})) {
+        $self->{fileSelector} = $self->toplevel()->FileSelect('-filter' => "*.tde");
+    }
+    my ($response, $filename);
+    for ( ; ; ) {
+        $filename = $self->{fileSelector}->Show();
+        return if (!defined($filename) or ($filename eq ''));
+        return unless($self->Save($filename));
+        $response = $self->toplevel->Dialog('-title'   => "File Error!",
+                                            '-text'    => "error in Save",
+                                            '-buttons' => ['Cancel', 'Try again']) ->Show();
+        return unless ($response eq 'Try again');
+    }
+}
+
+sub SaveQuit {
+    my ($self, $filename) = @_;
+
+    $self->Quit unless ($self->Save);
+}
+
+sub Save {
+    my ($self, $filename) = @_;
+
+    $filename = $self->cget('-filename') unless(defined($filename));
+    unless(defined($filename)) {                # still not defined?  get user input
+        $self->SaveAs();
+        return(0);
+    }
+    my $fp = IO::File->new(">$filename");       # open the file
+    unless ($fp) {
+        $self->Error("Can't open $filename for writing");
+        return(1);
+    }
+    my $oldCursor = $self->{text}->cget('cursor');
+    $self->{text}->configure('-cursor' => 'watch');
+    $self->update();
+    my $tourney = $self->{agaTourn}->Tourney();
+    $fp->print("    # $tourney Round $self->{round}\n\n");
+    my $maxNameLength = $self->{agaTourn}->NameLength();
+    my ($idx, $bId, $wId, $resu, $handi, $komi);
+    for ($idx = 0; $idx < @{$self->{wId}}; $idx++) {
+        $wId = $self->{wId}[$idx];
+        $bId = $self->{bId}[$idx];
+        $resu = $self->{resu}{"$wId,$bId"};
+        $handi = $self->{handi}{"$wId,$bId"};
+        $komi = $self->{komi}{"$wId,$bId"};
+        $resu = '?' unless (defined($resu));
+        $handi = $self->{handiGuess}{"$wId,$bId"} unless(defined($handi));
+        $komi = $self->{komiGuess}{"$wId,$bId"} unless(defined($komi));
+        $fp->printf("%-8.8s", $wId);
+        $fp->printf(" %-8.8s", $bId);
+        $fp->printf(" %1.1s", $resu);
+        $fp->printf(" %1.1s", $handi > 0 ? $handi : -$handi);
+        $fp->printf(" %3.3s", $komi);
+        if ($handi < 0) {
+            $self->Error(sprintf "Converting negative handicap at line %d", $idx + 1);
+        }
+        $fp->printf(" # ");
+        $fp->printf("%*.*s %5.1f", $maxNameLength, $maxNameLength, $self->{names}{$wId}, $self->{rating}{$wId});
+        $fp->printf(" ");
+        $fp->printf("%-5.1f %-*.*s", $self->{rating}{$bId}, $maxNameLength, $maxNameLength, $self->{names}{$bId});
+        $fp->printf("\n");
+    }
+    $fp->printf("\n");
+    my ($type, $comments, $byeId);
+    for( ; $idx < @{$self->{bye}}; $idx++) {
+        $byeId = $self->{bye}[$idx];
+        $type = 'BYE: ';
+        $comments = lc($self->{comments}{$byeId});
+        $type = 'DROP:' if ($comments =~ m/drop/);
+        $fp->printf("# $type %-8.8s %s\n", $byeId, $self->{names}{$byeId});
+    }
+    $fp->close;
+    $self->{saveIdx} = $self->{histIdx};
+    my $fname = $self->cget('-filename');
+    my @msg = `tpairs $fname 2>&1`;     # reformat into a nicer printable form
+    foreach (@msg) {
+        # next if (/AGATourn:ReadTdeFile: Reading .*tde\n$/);
+        next if (/^Writing pairs\d+\n$/);
+        $self->Error(join('', "tpairs program printed:\n\n", @msg)); # hmm, something unexpected.  show the whole message
+        last;
+    }
+    $self->{text}->configure('-cursor' => $oldCursor);
+    return(0)
+}
+
+sub RunPairings {     # run pairings program
+    my ($self, $increment) = @_;
+
+    return if ($self->SaveQuery() eq 'Abort');  # save current info, if necessary
+    my $round = $self->{round} + $increment;
+    my $filename = "$round.tde";
+    my $response;
+    if (-f $filename) {
+        $response = $self->toplevel->Dialog('-title'   => "File Exists!",
+                                            '-text'    => "$filename already exists.  Overwrite it?",
+                                            '-buttons' => ['OverWrite', 'Cancel']) ->Show();
+        return unless ($response eq 'OverWrite');
+    }
+    my $allDone = 1;    # assume all results are in
+    my $anyDone = 0;    # assume no results are in
+    foreach(values(%{$self->{resu}})) {
+        if ($_ eq '?') {
+            $allDone = 0;       # at least one not done
+        } else {
+            $anyDone = 1;       # at least one is done
+        }
+    }
+    if ($round == $self->{round}) {     # re-pair this round
+        if ($anyDone) {                 # have we already got some results recorded?
+            $response = $self->toplevel->Dialog('-title'   => "Results Recorded!",
+                                                '-text'    => "Results have already been recorded.  Throw them away?",
+                                                '-buttons' => ['Throw Away Results', 'Cancel "Re-Pair"']) ->Show();
+            return unless($response eq 'Throw Away Results');
+        }
+    } else {                    # pair next round
+        unless ($allDone) {     # have we got all results from this round yet?
+            my $nextRound = $self->{round} + 1;
+            $response = $self->toplevel->Dialog('-title'   => "Not All Results Recorded!",
+                                                '-text'    => "Not all results have been recorded" .
+                                                              " for round $self->{round}.  Pair round " .
+                                                              "$nextRound anyway?",
+                                                '-buttons' => ['Continue pairing', 'Cancel pairing']) ->Show();
+            return unless($response eq 'Continue pairing');
+        }
+    }
+    my $oldCursor = $self->{text}->cget('cursor');
+    $self->{text}->configure('-cursor' => 'watch');
+    $self->update();
+    system("around -ow -x $round");     # run around to do pairings
+    $self->{text}->configure('-cursor' => $oldCursor);
+    $self->Open($filename);
+}
+
+sub Help {
+    my ($self, $type) = @_;
+
+    my $text;
+    if ($type eq 'Help') {
+        $text = "$main::myName is used to adjust American Go Association (AGA) " .
+                "tournament pairings files.  These " .
+                "files are called 1.tde, 2.tde...\n" .
+                "\n" .
+                "You can start the program with \"$main::myName 3\" to adjust the third round file 3.tde.\n" .
+                "\n" .
+                "Adjustments to the round are done using various event bindings " .
+                "(see \"Help -> Bindings\" for more details)\n" .
+                "\n" .
+                "$main::myName keeps a history of your changes, so you can undo and re-do " .
+                "them using the Undo and Redo buttons (only the latest 'branch' is kept - " .
+                "if you undo 3 changes, then make a change, the three undone changes cannot be redone).\n" .
+                "\n" .
+                "$main::myName tries to guess handicap and komi for new matches. " .
+                "If the match needs a negative or a very large handicap (more than 9 stones), " .
+                "$main::myName marks the background red. " .
+                "If the handicap is reasonable, $main::myName colors the background " .
+                "pale blue.  Green background indicates the handicap/komi are the 'official' " .
+                "values (from the tournament pairing file).\n" .
+                "\n";
+    } elsif ($type eq 'Bindings') {
+        $text = "Results:\n" .
+                "Winner/loser can be set to w, b, or '?' (white, black, or unknown).  Pressing " .
+                "'w', 'b', 'x', or '?' sets the results on the currently selected line, and moves the " .
+                "selection to the next line.  Using capitals ('W', 'B', 'X', or '/') causes the selection " .
+                "to move up one line instead of down.  Arrow keys move the selection up, down, left, and right.\n" .  
+                "\n" .
+                "Handi, Komi:\n" .
+                "Adjust handicaps and komi by selecting the appropriate item (left mouse " .
+                "click or arrow keys) and typing '+' or '-'. \n" .
+                "\n" .
+                "Changing players:\n" .
+                "  The right mouse button pops up a context menu with several selections:\n" .
+                "    File   -> Exit:          another way to quit $main::myName\n" .
+                "    Edit   -> Copy:          does nothing\n" .
+                "    Edit   -> Select All:    selects all the text for export\n" .
+                "           -> Unselect All:  removes selection\n" .
+                "    Search -> Find:          pops up a search dialog box\n" .
+                "           -> Find Next:     finds next occurance of search term\n" .
+                "           -> Find Previous: finds previous occurance of search term\n" .
+                "    View   -> Select All:    selects all the text for export\n" .
+                "    Swap:                    swap with selected player\n" .
+                "    Match:                   match with selected player\n" .
+                "    Unmatch:                 unmatch game under cursor\n" .
+                "\n";
+    } elsif ($type eq 'Tourney') {
+    } elsif ($type eq 'About') {
+        $text = "  $main::myName version $main::VERSION\n\n" .
+                "  copyright (C) 1999, 2004, 2005 Reid Augustin.\n\n" .
+                "  " . $self->{agaTourn}->Tourney() . "\n" .
+                "  Round $self->{round}\n";
+    } else {
+        $self->Error("Unknown help type: $type\n");
+        return;
+    }
+    $self->toplevel->TextBox(
+            '-title' => "$main::myName help: $type",
+            '-text' => $text);
+}
+
+sub Read {
+    my ($self, $newName) = @_;
+
+    return if ($self->SaveQuery() eq 'Abort');
+    $self->configure('-filename', $newName);
+    my $oldCursor = $self->{text}->cget('cursor');
+    $self->{text}->configure('-cursor' => 'watch');
+    $self->update() if($self->{notFirstTime});
+    $self->{notFirstTime} = 1;;
+    # create agaTourn object, read register.tde, and all round files
+    $self->{agaTourn} = Games::Go::AGATourn->new();
+    die("Aborting...\n") if (not defined($self->{agaTourn}) or $self->{agaTourn}->Error);
+    my $filename = my $round = $self->cget('-filename');
+    $round =~ s/\.tde//i;               # remove suffix
+    die ("Round filename format problem: I need 1.tde, 2.tde, etc.\n") if ($round =~ m/\D/);
+    $self->{round} = $round;
+    foreach (qw(wId bId bye)) {
+        $self->{$_} = [];               # empty the arrays
+    }
+    foreach (qw(resu handi komi)) {
+        $self->{$_} = {};               # empty the hashes
+    }
+    my $games = $self->{agaTourn}->GamesList();              # "$wId,$bId,$resu,$handi,$komi,$self->{Round}"
+    unless(@{$games}) {
+        $self->Error("No Games in $filename!");
+        die "No Games in $filename!\n"  if($self->cget('-format_only'));
+    }
+    $self->{names} = $self->{agaTourn}->Name();
+    $self->{rating} = $self->{agaTourn}->Rating();
+    $self->{comments} = $self->{agaTourn}->Comment();       # so we know BYEs from DROPs
+    $self->{rules} = uc($self->{agaTourn}->Directive('RULES')->[0]);
+    $self->{rules} = 'AGA' unless defined($self->{rules});
+    if ($self->{rules} eq 'ING') {
+        $self->{normalKomi} = 7;
+        $self->{noKomi} = -1;           # because black wins ties
+        $self->{reverseKomi} = -7;
+    } else {
+        $self->{normalKomi} = 5;
+        $self->{noKomi} = 0;
+        $self->{reverseKomi} = -5;
+    }
+    my %byes = %{$self->{names}};                               # copy to find BYEs (by removing all active players)
+    my ($wId, $bId, $resu, $handi, $komi, $gRound);
+    foreach (@$games) {
+        ($wId, $bId, $resu, $handi, $komi, $gRound) = split(/,/, $_);
+        if (($resu eq 'w') or ($resu eq 'b')) {
+            push(@{$self->{already}{$wId}}, $bId);       # record two 'already played'
+            push(@{$self->{already}{$bId}}, $wId);
+        }
+        next if ($round != $gRound);
+        if (exists($self->{names}{$wId}) and
+            exists($self->{names}{$bId})) {
+            push(@{$self->{bye}}, undef);                           # put undefs in lower part of bye array
+            push(@{$self->{wId}}, $wId);
+            push(@{$self->{bId}}, $bId);
+            $self->{resu}{"$wId,$bId"} = $resu;
+            $self->{handi}{"$wId,$bId"} = $handi;
+            $self->{komi}{"$wId,$bId"} = $komi;
+            $self->{komi}{"$wId,$bId"} = $self->CheckHK($handi, $komi);
+            $self->{hkBg}{"$wId,$bId"} = $hkGood;                   # set background to known good for this match
+            unless(exists($byes{$wId})) {
+                $self->Error("$wId $self->{names}{$wId} is playing more than one game this round?");
+            }
+            unless(exists($byes{$bId})) {
+                $self->Error("$bId $self->{names}{$bId} is playing more than one game this round?");
+            }
+            delete($byes{$wId});                                    # not a BYE - remove him
+            delete($byes{$bId});                                    # not a BYE - remove him
+        } else {
+            unless(exists($self->{names}{$wId})) {
+                $self->Error("Player ID $wId not in register.tde?");
+                delete($byes{$wId});
+            }
+            unless(exists($self->{names}{$bId})) {
+                $self->Error("Player ID $bId not in register.tde?");
+                delete($byes{$bId});
+            }
+        }
+    }
+    push(@{$self->{bye}}, sort {$self->{rating}{$b} <=> $self->{rating}{$a}} (keys(%byes))); # add byes to end of list
+    $self->Clear();
+    my $idx;
+    for ($idx = -1; $idx < @{$self->{bye}}; $idx++) {
+        $self->RefreshIdx($idx);
+    }
+    $self->{text}->focus();
+    $self->{round} = $round;
+    $self->toplevel()->title("$main::myName: $newName");        # set window title
+    $self->{text}->configure('-cursor' => $oldCursor);
+    return(0);
+}
+
+sub RefreshIdx {
+    my ($self, $idx) = @_;
+
+    my ($line, $t, $tagStart);
+    $line = $idx;
+    $line += 2;                         # lines in text are 1 based, line 1 is the header
+    $t = $self->{text};
+    $t->configure('-state' => 'normal');
+    $t->delete("$line.0", "$line.end");       # clear the current stuff out
+    $t->markSet('insert', "$line.0");
+    my $maxNameLength = $self->{agaTourn}->NameLength();
+    if ($line == 1) {                   # print a header
+        $t->insert('insert', "tbl win hndi komi", "header");
+        $t->insert('insert', sprintf("%*.*s   rtg ", $maxNameLength-2, $maxNameLength-2, "White Player"), "header");
+        $t->insert('insert', sprintf("rtg   %-*.*s", $maxNameLength, $maxNameLength, "Black Player"), "header");
+        my $width = length($t->get("$line.0", 'insert'));
+        $t->configure('-width' => $width + 1);
+    } elsif (($idx < @{$self->{wId}})) {   # an active game line
+        my $wId = $self->{wId}[$idx];
+        my $bId = $self->{bId}[$idx];
+        my $resu = $self->{resu}{"$wId,$bId"};
+        my $handi = $self->{handi}{"$wId,$bId"};
+        my $komi = $self->{komi}{"$wId,$bId"};
+        $resu = '?' if (!defined($resu) or ($resu eq 'x'));  # change 'x' to '?' in result field
+        #$handi = $self->{handiGuess}{"$wId,$bId"} if (defined($self->{handiGuess}{"$wId,$bId"}));
+        #$komi = $self->{komiGuess}{"$wId,$bId"} if (defined($self->{komiGuess}{"$wId,$bId"}));
+        $handi = $self->{handiGuess}{"$wId,$bId"} unless(defined($handi));
+        $komi = $self->{komiGuess}{"$wId,$bId"} unless(defined($komi));
+        $t->insert('insert', sprintf("%3.3s ", $line - 1));
+        $t->insert('insert', sprintf(" %1.1s ", $resu), "resu$idx");
+        $t->tagBind("resu$idx", '<1>', [$self => 'Button1', 'resu', $idx]);
+        $t->insert('insert', sprintf(" %2.2s ", $handi), "handi$idx");
+        $t->tagBind("handi$idx", '<1>', [$self => 'Button1', 'handi', $idx]);
+        $t->insert('insert', sprintf("%3.3s ", $komi), "komi$idx");
+        $t->tagBind("komi$idx", '<1>', [$self => 'Button1', 'komi', $idx]);
+        $t->tagConfigure("handi$idx", '-background' => $self->{hkBg}{"$wId,$bId"});
+        $t->tagConfigure("komi$idx", '-background' => $self->{hkBg}{"$wId,$bId"});
+        my $wName = $self->{names}{$wId};
+        $t->insert('insert', ' ' x ($maxNameLength - length($wName)));    # space before white name
+        $tagStart = $t->index('insert');
+        $t->insert('insert',
+                   sprintf("$wName %5.1f",
+                           $self->{rating}{$wId}),
+                   ["wId$idx", $self->alreadyTags($wId)]);
+        if ($resu eq 'w') {
+            $t->tagAdd('win', $tagStart, $t->index('insert'));
+        } elsif ($resu eq 'b') {
+            $t->tagAdd('lose', $tagStart, $t->index('insert'));
+        }
+        $t->tagBind("wId$idx", '<1>', [$self => 'Button1', 'wId', $idx]);
+        $t->tagBind("wId$idx", '<3>', [$self => 'Button3', 'wId', $idx]);
+
+        $t->insert('insert', " ");                              # blank between players
+
+        my $bName = $self->{names}{$bId};
+        $tagStart = $t->index('insert');
+        $t->insert('insert',
+                    sprintf("%-5.1f $bName",
+                            $self->{rating}{$bId}),
+                    ["bId$idx", $self->alreadyTags($bId)]);
+        if ($resu eq 'w') {
+            $t->tagAdd('lose', $tagStart, $t->index('insert'));
+        } elsif ($resu eq 'b') {
+            $t->tagAdd('win', $tagStart, $t->index('insert'));
+        }
+        $t->tagBind("bId$idx", '<1>', [$self => 'Button1', 'bId', $idx]);
+        $t->tagBind("bId$idx", '<3>', [$self => 'Button3', 'bId', $idx]);
+    } elsif (exists($self->{bye}) and ($idx < @{$self->{bye}})) {      # a BYE
+        my $byeId = $self->{bye}[$idx];
+        my $type = 'BYE: ';
+        my $comments = lc($self->{comments}{$byeId});
+        $type = 'DROP:' if ($comments =~ m/drop/);
+        $t->insert('insert',
+                    sprintf("$type %*.*s %5.1f",
+                                $maxNameLength,
+                                $maxNameLength,
+                                $self->{names}{$byeId},
+                                $self->{rating}{$byeId},),
+                    ["bye$idx", $self->alreadyTags($byeId)]);
+        $t->tagBind("bye$idx", '<1>', [$self => 'Button1', 'bye', $idx]);
+        $t->tagBind("bye$idx", '<3>', [$self => 'Button3', 'bye', $idx]);
+    } else {
+        $self->Error("ArAdj::RefreshIdx($idx): index too large");
+    }
+    if ($line > $self->{lines}) {
+        $t->insert('insert', "\n");
+        $self->{lines} = $line;
+    }
+    $self->{text}->configure('-state' => 'disabled');
+    if (defined($self->{selectedIdx}) && ($idx == $self->{selectedIdx})) {
+        $self->Button1_noBreak($self->{selectedField}, $self->{selectedIdx});    # make sure this line shows as selected
+        $t->yview('-pickplace', "$line.0");
+    }
+}
+
+# return an array of tags used to highlight opponents we've already played
+sub alreadyTags {
+    my ($self, $id) = @_;
+
+    my @tags;
+    foreach (@{$self->{already}{$id}}) {
+        push (@tags, "already$_");
+    }
+    return @tags;
+}
+
+
+sub Button1_noBreak {
+    my ($self, $field, $idx) = @_;
+
+    $self->{selectedIdx} = 0 unless(defined($self->{selectedIdx}));
+    $self->{selectedField} = 'resu' unless(defined($self->{selectedField}));
+    $field = $self->{selectedField} unless(defined($field));
+    if ($idx eq 'up') {
+        $idx = $self->{selectedIdx};
+        $idx-- if ($idx > 0);
+    } elsif ($idx eq 'down') {
+        $idx = $self->{selectedIdx};
+        $idx++ if ($idx < (@{$self->{bye}} - 1));
+    } elsif ($idx eq 'left') {
+        if ($field eq 'bId') {
+            $field = 'wId';
+        } elsif ($field eq 'wId') {
+            $field = 'komi';
+        } elsif ($field eq 'komi') {
+            $field = 'handi';
+        } elsif ($field eq 'handi') {
+            $field = 'resu';
+        }
+        $idx = $self->{selectedIdx};
+    } elsif ($idx eq 'right') {
+        if ($field eq 'resu') {
+            $field = 'handi';
+        } elsif ($field eq 'handi') {
+            $field = 'komi';
+        } elsif ($field eq 'komi') {
+            $field = 'wId';
+        } elsif ($field eq 'wId') {
+            $field = 'bId';
+        }
+        $idx = $self->{selectedIdx};
+    }
+    if ($idx >= @{$self->{wId}}) {      # in the 'bye' area?
+        $field = 'bye';                 # there's only one field in this area
+    } else {                            # in the valid games area?
+        if ($field eq 'bye') {
+            $field = $self->{prevSelField};     # restore from when we were in the valid area before
+        } else {
+            $self->{prevSelField} = $field;
+        }
+    }
+    $self->{selectedField} = $field;
+    $self->{selectedIdx} = $idx;
+    my $t = $self->{text};
+    my @ranges = $t->tagRanges("$field$idx");
+    $t->tagDelete('selected');
+    if(@ranges) {
+        $t->tagAdd('selected', $ranges[0], $ranges[1]);
+        $t->markSet('insert', $ranges[0]);          # move insertion mark to start of selected area
+    }
+    $t->tagConfigure("selected",
+                     '-background' => $selectBg);
+    $t->yview('-pickplace', $ranges[0]);
+    # now if we're selecting a name, pick out the people this
+    #     person has already played and highlight them
+    if (exists($self->{alreadyTagged})) {
+        $t->tagConfigure($self->{alreadyTagged},                # unhighlight old 'already' tags
+                         -background => $self->{normalBackground});
+        $t->tagRaise(delete($self->{alreadyTagged}));           # need to raise it to show
+    }
+    $self->update;
+    if (($field eq 'wId') or
+        ($field eq 'bId') or
+        ($field eq 'bye')) {
+        my $id;
+        if ($field eq 'wId') {
+            $id = $self->{wId}[$idx];
+        } elsif ($field eq 'bId') {
+            $id = $self->{bId}[$idx];
+        } elsif ($field eq 'bye') {
+            $id = $self->{bye}[$idx];
+        }
+        $self->{alreadyTagged} = "already$id";
+        $t->tagConfigure("already$id",
+                         -background => $alreadyBg);
+        $t->tagRaise("already$id");
+    }
+}
+
+sub Button1 {
+    my ($self, $field, $idx) = @_;
+
+    $self->Button1_noBreak($field, $idx);
+    $self->{text}->break;  # prevent default button1 bindings
+}
+
+sub AddSwap {
+    my ($self, $srcField, $srcIdx, $destField, $destIdx) = @_;
+
+    $self->Add('forward', [$self => 'Swap', $srcField, $srcIdx, $destField, $destIdx]);
+    $self->Add('backward', [$self => 'Swap', $destField, $destIdx, $srcField, $srcIdx]);
+    $self->Forward(scalar(@{$self->{forward}}));                    # forward to end of history buffer
+}
+
+sub AddMatch {
+    my ($self, $bIdx, $wIdx, $matchIdx) = @_;
+
+    $self->Add('forward', [$self => 'Match', $bIdx, $wIdx, $matchIdx]);
+    $self->Add('backward', [$self => 'Unmatch', $matchIdx, $bIdx + 1, $wIdx + 1]);
+    $self->Forward(scalar(@{$self->{forward}}));                    # forward to end of history buffer
+}
+
+sub AddUnMatch {
+    my ($self, $idx, $byeIdx) = @_;
+
+    $self->Add('forward', [$self => 'Unmatch', $idx, $byeIdx, $byeIdx + 1]);
+    $self->Add('backward', [$self => 'Match', $byeIdx - 1, $byeIdx, $idx]);
+    $self->Forward(scalar(@{$self->{forward}}));                    # forward to end of history buffer
+}
+
+sub Button3 {
+    my ($self, $field, $idx) = @_;
+
+    my $t = $self->{text};
+    my $selField = $self->{selectedField};
+    my $selIdx = $self->{selectedIdx};
+    my $m = $t->menu;
+    unless(exists($self->{context})) {
+        # add to default context menu:
+        $self->{context} = $m;
+        $m->add('command',
+                -label => 'Swap',
+                -state => 'disabled',
+                );
+        $m->add('command',
+                -label => 'UnMatch',
+                -state => 'disabled',
+                );
+        $m->add('command',
+                -label => 'Match',
+                -state => 'disabled',
+                );
+    }
+    my ($swapState, $unmatchState, $matchState) = qw(disabled disabled disabled);
+    # Swap menu entry:
+    if(defined($selField) and           # swapee defined?
+       ((($selField eq 'wId') or
+         ($selField eq 'bye') or        # can only swap IDs
+         ($selField eq 'bId')) and      # or byes
+        (($field eq 'wId') or
+         ($field eq 'bId') or
+         ($field eq 'bId')) and
+        (($selIdx != $idx) or
+         ($selField ne $field)))) {     # only if they're not the same person
+        $swapState = 'normal';          # enable Swap menu entry
+    }
+    $m->entryconfigure('Swap',
+                      -command => [$self => 'AddSwap', $selField, $selIdx, $field, $idx],
+                      -state => $swapState);
+    # UnMatch menu entry:
+    if($idx <= @{$self->{wId}}) {       # can't unmatch byes
+        $unmatchState = 'normal';         # enable Match menu entry
+    }
+    $m->entryconfigure('UnMatch',
+                      -command => [$self => 'AddUnMatch', $idx, scalar(@{$self->{wId}})],
+                      -state => $unmatchState);
+    # Match menu entry:
+    my $matchIdx = @{$self->{wId}}; # add new match to end of match list
+    my ($bIdx, $wIdx);
+    if(defined($selField) and           # first player defined?
+       (defined($selIdx) and
+        ($selIdx != $idx)) and          # can't match player against himself
+       (($field eq 'bye') and
+        ($selField eq 'bye'))) {        # can only match bye against bye
+        if ($self->{rating}{$self->{$selField}[$selIdx]} < $self->{rating}{$self->{$field}[$idx]}) {
+            $bIdx = $idx;
+            $wIdx = $selIdx;
+        } else {
+            $bIdx = $selIdx;
+            $wIdx = $idx;
+        }
+        $matchState = 'normal';         # enable Match menu entry
+    }
+    $m->entryconfigure('Match',
+                      -command => [$self => 'AddMatch', $bIdx, $wIdx, scalar(@{$self->{wId}})],
+                      -state => $matchState);
+    $t->break;  # prevent default text button3 action
+}
+
+sub Add {
+    my ($self, $direction, @args) = @_;
+
+    splice(@{$self->{$direction}}, $self->{histIdx});       # remove everything after our current seek position
+    push(@{$self->{$direction}[$self->{histIdx}]}, \@args);
+}
+
+sub Forward {
+    my ($self, $idx) = @_;
+
+    $idx = $self->{histIdx} + 1 unless(defined($idx));
+    my ($cmdList, $obj, $method, @cmd);
+    while ($self->{histIdx} < $idx) {
+        foreach $cmdList (@{$self->{forward}[$self->{histIdx}]}) {
+            foreach (@$cmdList) {
+                @cmd = @$_;
+                $obj = shift(@cmd);
+                $method = shift(@cmd);
+                $obj->$method(@cmd);
+            }
+        }
+        $self->{histIdx}++;
+    }
+    if ($self->{histIdx} >= @{$self->{forward}}) {
+        $self->{redoButton}->configure('-state' => 'disabled');
+    }
+    if ($self->{histIdx} >= 0) {
+        $self->{undoButton}->configure('-state' => 'normal');
+    }
+}
+
+sub Backward {
+    my ($self, $idx) = @_;
+
+    $idx = $self->{histIdx} unless(defined($idx));
+    my ($cmdList, $obj, $method, @cmd);
+    do {
+        $self->{histIdx}--;
+        foreach $cmdList (@{$self->{backward}[$self->{histIdx}]}) {
+            foreach (@$cmdList) {
+                @cmd = @$_;
+                $obj = shift(@cmd);
+                $method = shift(@cmd);
+                $obj->$method(@cmd);
+            }
+        }
+    } while ($self->{histIdx} >= $idx);
+    if ($self->{histIdx} <= 0) {
+        $self->{undoButton}->configure('-state' => 'disabled');
+    }
+    if ($self->{histIdx} <= @{$self->{forward}}) {
+        $self->{redoButton}->configure('-state' => 'normal');
+    }
+}
+
+sub Match {     # match two byes to create a new game
+    my ($self, $byeWidx, $byeBidx, $matchIdx) = @_;
+
+    my $wId = $self->{bye}[$byeWidx];
+    my $bId = $self->{bye}[$byeBidx];
+    splice(@{$self->{wId}}, $matchIdx, 0, $wId);        # insert into game list
+    splice(@{$self->{bId}}, $matchIdx, 0, $bId);
+    $self->{resu}{"$wId,$bId"} = '?' unless(defined($self->{resu}{"$wId,$bId"}));
+    $self->GuessHK($matchIdx);                          # make a guess at handi and komi for new match
+    if ($byeWidx > $byeBidx) {
+        splice(@{$self->{bye}}, $byeWidx, 1);           # remove from BYE list
+        splice(@{$self->{bye}}, $byeBidx, 1);
+    } else {
+        splice(@{$self->{bye}}, $byeBidx, 1);           # reverse removal order (remove larger index first)
+        splice(@{$self->{bye}}, $byeWidx, 1);
+    }
+    splice(@{$self->{bye}}, 0, 0, undef);               # insert one undef at start of BYE list
+    $self->{selectedField} = 'wId';
+    $self->{selectedIdx} = $matchIdx;
+    my $idx;
+    for ($idx = $matchIdx; $idx < @{$self->{bye}}; $idx++) {
+        $self->RefreshIdx($idx);
+    }
+    my $last = @{$self->{bye}} + 2;
+    $self->{text}->configure('-state' => 'normal');
+    $self->{text}->delete("$last.0", "$last.end + 1 char");     # delete extra line at the end
+    $self->{text}->configure('-state' => 'disabled');
+    $self->{lines}--;
+}
+
+sub Unmatch {
+    my ($self, $matchIdx, $byeWidx, $byeBidx) = @_;
+
+    my $wId = $self->{wId}[$matchIdx];
+    my $bId = $self->{bId}[$matchIdx];
+    splice(@{$self->{wId}}, $matchIdx, 1);           # remove entries from game lists
+    splice(@{$self->{bId}}, $matchIdx, 1);
+    if ($byeWidx > $byeBidx) {
+        splice(@{$self->{bye}}, $byeWidx - 1, 0, $wId); # insert into BYE list
+        splice(@{$self->{bye}}, $byeBidx, 0, $bId);
+    } else {
+        splice(@{$self->{bye}}, $byeBidx - 1, 0, $bId); # reverse insertion order (insert larger index first)
+        splice(@{$self->{bye}}, $byeWidx, 0, $wId);
+    }
+    splice(@{$self->{bye}}, 0, 1);                      # remove one undef at start of BYE list
+    my $idx;
+    for ($idx = $matchIdx; $idx < @{$self->{bye}}; $idx++) {
+        $self->RefreshIdx($idx);
+    }
+}
+
+sub Swap {
+    my ($self, $selField, $selIdx, $field, $idx) = @_;
+
+    my $tmp = $self->{$selField}[$selIdx];
+    $self->{$selField}[$selIdx] = $self->{$field}[$idx];
+    $self->{$field}[$idx] = $tmp;
+    $self->GuessHK($selIdx);
+    $self->RefreshIdx($selIdx);
+    if ($selIdx != $idx) {
+        $self->GuessHK($idx);
+        $self->RefreshIdx($idx);
+    }
+}
+
+sub CheckHK {   # check handicap and komi against the RULES directive - handicap has priority
+    my ($self, $handi, $komi) = @_;
+
+    my $newKomi = $komi;
+    if ($handi == 0) {
+        if ($komi > $self->{noKomi}) {
+            $newKomi = $self->{normalKomi};
+        } elsif ($komi > $self->{reverseKomi}) {
+            $newKomi = $self->{noKomi};
+        } else {
+            $newKomi = $self->{reverseKomi};
+        }
+    } else {
+        $newKomi = ($self->{rules} eq 'ING') ? -$handi : 0;
+    }
+    if ($newKomi != $komi) {
+        STDERR->print("Warning: $self->{rules} rules, handicap: $handi, komi: $komi changed to $newKomi\n");
+    }
+    return($newKomi);
+}
+
+sub GuessHK {   # guess at handicap and komi for a new match
+    my ($self, $matchIdx) = @_;
+
+    return unless($matchIdx < @{$self->{wId}}); # if this is a bye, just return
+    my $wId = $self->{wId}[$matchIdx];
+    my $bId = $self->{bId}[$matchIdx];
+    if (defined($self->{handi}{"$wId,$bId"}) &&
+        defined($self->{komi}{"$wId,$bId"})) {
+        $self->{hkBg}{"$wId,$bId"} = $hkGood;   # just used "official" value
+        return;
+    }
+    my ($handi, $komi) = $self->{agaTourn}->Handicap($wId, $bId);
+    if ($handi < 0) {
+        $self->{hkBg}{"$wId,$bId"} = $hkBad;
+    } else {
+        $self->{hkBg}{"$wId,$bId"} = $hkGuess;
+    }
+    $self->{handiGuess}{"$wId,$bId"} = $handi;
+    $self->{komiGuess}{"$wId,$bId"} = $komi;
+    $self->{resu}{"wId,bId"} = '?' unless(defined($self->{resu}{"wId,bId"}));
+}
+
+sub AdjustValue {
+    my ($self, $val) = @_;
+
+    return unless(defined($self->{selectedField}));
+    my $idx = $self->{selectedIdx};
+    return if ($idx > @{$self->{wId}});         # can't adjust bye values
+
+    my $field = $self->{selectedField};
+    return unless(($field eq 'handi') or ($field eq 'komi'));
+    $self->{selectedIdx} = $idx;
+    $self->{selectedField} = $field;
+    my $id = "$self->{wId}[$idx],$self->{bId}[$idx]";
+    my $handi = exists ($self->{handi}{$id}) ? $self->{handi}{$id} : $self->{handiGuess}{$id} ;
+    my $komi = exists ($self->{komi}{$id}) ? $self->{komi}{$id} : $self->{komiGuess}{$id} ;
+    if ($field eq 'handi') {
+        if ($val == -1) {
+            if ($handi == 0) {
+                if ($komi < $self->{noKomi}) {
+                    $komi = $self->{noKomi};
+                } elsif ($komi < $self->{normalKomi}) {
+                    $komi = $self->{normalKomi};
+                } # else - don't go any farther - need to swap black/white
+            } elsif ($handi == 2) {
+                $handi = 0;
+                $komi = $self->{reverseKomi};
+            } else {
+                $handi--;
+                $komi = ($self->{rules} eq 'ING') ? -$handi : 0;
+            }
+        } else {
+            if ($handi == 0) {
+                if ($komi > $self->{noKomi}) {
+                    $komi = $self->{noKomi};
+                } elsif ($komi > $self->{reverseKomi}) {
+                    $komi = $self->{reverseKomi};
+                } else {
+                    $handi = 2;
+                    $komi = ($self->{rules} eq 'ING') ? -$handi : 0;
+                }
+            } elsif ($handi < 9) {
+                $handi++;
+                $handi++ if ($handi == 1);
+                $komi = ($self->{rules} eq 'ING') ? -$handi : 0;
+            }
+        }
+    } else {
+        $komi += $val;
+    }
+    return if (exists($self->{handi}{$id}) and
+               ($self->{handi}{$id} == $handi) and
+               exists($self->{komi}{$id}) and
+               ($self->{komi}{$id} == $komi));
+    $self->Add('forward', [$self => 'SetValue', $handi, $komi, $id, $idx]);
+    $self->Add('backward', [$self => 'SetValue', $self->{handi}{$id}, $self->{komi}{$id}, $id, $idx]);
+    $self->Forward(scalar(@{$self->{forward}}));    # forward to end of history buffer
+}
+
+sub SetValue {
+    my ($self, $handi, $komi, $id, $idx) = @_;
+
+    $self->{handi}{$id} = $handi;
+    $self->{komi}{$id} = $komi;
+    $self->RefreshIdx($idx);
+}
+
+sub ChangeResult {
+    my ($self, $char) = @_;
+
+    $self->{selectedIdx} = 0 unless(defined($self->{selectedIdx}));
+    my $newIdx = $self->{selectedIdx};
+    return unless($newIdx < @{$self->{wId}});
+    $self->{selectedField} = 'resu' unless(defined($self->{selectedField}));
+    my $id = "$self->{wId}[$newIdx],$self->{bId}[$newIdx]";
+    my $prevResu = $self->{resu}{$id};
+    my $newResu = lc($char);
+    if ($newResu eq $char) {
+        $newIdx++;
+        $newIdx = $#{$self->{bye}} if ($newIdx > $#{$self->{bye}});
+    } else {
+        $newIdx--;
+        $newIdx = 0 if ($newIdx < 0);
+    }
+    $newResu = '?' if ($newResu eq 'x');
+    $self->Add('forward', [$self => 'SetResult', $self->{selectedIdx}, $newResu, $newIdx, 'resu']);
+    $self->Add('backward', [$self => 'SetResult', $self->{selectedIdx}, $prevResu, $self->{selectedIdx}, $self->{selectedField}]);
+    $self->Forward(scalar(@{$self->{forward}}));                # forward to end of history buffer
+}
+
+sub SetResult {
+    my ($self, $idx, $newResu, $newIdx, $newField) = @_;
+
+    my $id = "$self->{wId}[$idx],$self->{bId}[$idx]";
+    $self->{resu}{$id} = $newResu;
+    $self->RefreshIdx($idx);
+    $self->{selectedIdx} = $newIdx;
+    $self->{selectedField} = $newField;
+    $self->RefreshIdx($newIdx);
+}
+
+sub ps {
+    my ($self) = @_;
+
+    my ($ii, $wId, $wName, $bId, $bName, $handi, $komi, $resu);
+    for ($ii = 0; $ii < @{$self->{wId}}; $ii++) {
+        $wId = $self->{wId}[$ii];
+        $wName = $self->{name}{$wId};
+        $bId = $self->{bId}[$ii];
+        $bName = $self->{name}{$bId};
+        $handi = $self->{handi}{"$wId,$bId"};
+        $komi = $self->{komi}{"$wId,$bId"};
+        $resu = $self->{resu}{"$wId,$bId"};
+        foreach(qw(wId wName bId bName handi komi resu)) {
+            no strict 'refs';
+            $$_ = 'undef' unless defined($$_);
+        }
+        STDERR->print("$ii: $wId $wName vs $bId $bName handi=$handi, komi=$komi, result=$resu\n");
+    }
+    for ($ii = 0; $ii < @{$self->{bye}}; $ii++) {
+        next unless(defined($self->{bye}[$ii]));
+        STDERR->print("$ii: BYE $self->{bye}[$ii]");
+        if ($ii < @{$self->{wId}}) {
+            STDERR->print("Oops! game/BYE conflict!");
+        }
+        STDERR->print("\n");
+    }
+}
+
+sub Clear {
+    my ($self) = @_;
+
+    $self->{text}->configure('-state' => 'normal');
+    $self->{text}->delete('1.0', 'end');
+    $self->{text}->configure('-state' => 'disabled');
+    $self->{lines} = 0;
+    $self->{selectedField} = undef;
+    $self->{selectedIdx} = undef;
+    $self->{history} = ();                                      # start a new history buffer
+    $self->{histIdx} = 0;
+    $self->{saveIdx} = 0;
+    $self->{selectedIdx} = 0;
+    $self->{selectedField} = 'resu';
+    $self->toplevel()->title("$main::myName: no file");        # set window title
+}
+
+package main;
+
+use Tk;
+
+our ($myName, $myDir);
+$myName = $0;           # full pathname of this file
+$myName =~ s"(.*)/"";   # delete any preceding path
+$myDir = $1;
+
+
+main();
+
+sub Usage {
+    print("Usage: aradjust [ options ]\n",
+          "      [ filename or round number]   adjust pairings/results for single file or round\n",
+          "      [ -f ]                        format only.  re-writes round file making minor\n",
+          "                                         corrections (like converting ING no-komi\n",
+          "                                         from -1 to 0)\n");
+}
+
+sub main {
+
+    my ($round, $ii, $filename);
+    my $format_only = 0;
+    for ($ii = 0; $ii < @ARGV; $ii++) {
+        if ($ARGV[$ii] eq '-f') {
+            $format_only = 1;
+        } elsif ($ARGV[$ii] =~ m/\D/) {
+            print("unknown option: $ARGV[$ii]\n");
+            Usage();
+            exit(1);
+        } else {
+            if (defined($round)) {
+                print("I can handle all rounds (no rounds option), or just one round at a time.\n");
+                Usage();
+                exit(1);
+            }
+            $round = $ARGV[$ii];
+        }
+    }
+    die ("No register.tde file\n") unless (-f 'register.tde');
+
+    unless(defined($round)) {
+        for ($round = 1; $round < 99; $round++) {
+            last unless (-f $round + 1 . ".tde");          # find last existing round file
+        }
+    }
+    for ($ii = 1; $ii < $round; $ii++) {
+        $filename =  $ii . ".tde";
+        die "$filename not found.  Sequential numbering, please.\n"  unless (-f $filename);
+    }
+    my $mw = MainWindow->new();
+    my $aradj;
+    if ($format_only) {
+        $aradj = $mw->ArAdj(-filename    => "$round.tde",
+                            -format_only => $format_only);
+        $aradj->Read("$round.tde");
+        $aradj->Save;
+    } else {
+        $aradj = $mw->ArAdj(-filename    => "$round.tde",
+                            -format_only => $format_only);
+        $SIG{'INT'} = sub {$aradj->Quit;};
+        $mw->protocol('WM_DELETE_WINDOW', sub {$aradj->Quit;});
+        $aradj->pack('-expand' => 'true', '-fill' => 'both');
+        $mw->MainLoop();                   # start up the event loop
+    }
+}
+
+__END__
+
+=head1 NAME
+
+aradjust - adjust pairings and enter results for a round
+
+=head1 SYNOPSIS
+
+aradjust [ round_number ] [ -f ]
+
+=head1 DESCRIPTION
+
+GUI to adjust AGA (American Go Association) tournament round files (1.tde, 2.tde, etc).
+Pairings can be made, broken, and changed, and final results entered (winners and losers).
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<round_number>
+
+The default is to adjust the current round (based on the last n.tde file).  Previous rounds can
+be adjusted by adding providing round number as a command line argument.  The round can also be
+selected within the GUI.
+
+=item B<-f>
+
+If -f (format only) is specified, aradjust reads the 1.tde file, reformats it, and writes it back
+out.  Only minor corrections (such as changing ING no-komi games from -1 komi to 0) are made.
+
+=back
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o around(1)   - pair a tournament round
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tpairs(1)   - convert pairings from AGA format to printable
+
+=item o tscore(1)   - score a tournament
+
+=item o send2AGA(1) - prepare tournament result for sending to AGA
+
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=item o Games::Go::TDEntry(3)  - perl/Tk widget support for TDFinder
+
+=item o Games::Go::TDFinder(3) - perl/Tk tdfind support widgets
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 1999, 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

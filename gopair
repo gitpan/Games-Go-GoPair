@@ -1,0 +1,921 @@
+#!/usr/bin/perl -w
+# $Id: gopair,v 1.12 2005/01/23 18:59:53 reid Exp $
+
+#   gopair
+#
+#   Copyright (C) 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+#
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but
+#   WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+#   or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# todo:
+
+=head1 NAME
+
+gopair - Perl script to generate go tournament pairings
+
+=head1 SYNOPSIS
+
+    $ gopair [ options ] [ round_number ]
+
+=head1 DESCRIPTION
+
+gopair uses the Pair perl extension to find the locally best pairings
+according to criteria determined by some register.tde directives.  A normal
+handicapped pairing (##HANDICAPS MAX) uses the following Pair scores:
+
+    -1   * abs(rating difference)
+    -1.5 * abs (wins difference)
+    -2   * (belong to the same club) 
+    -16  * (already played each other)
+
+A non-handicapped pairing (## HANDICAPS MIN) uses these scores:
+
+     0   * abs(rating difference)
+    -1.5 * abs (wins difference)
+     0   * (belong to the same club) 
+    -16  * (already played each other)
+
+Additionally, early round pairings are adjusted so that the 'best' opponent is
+artifically knocked down a few places so that the most interesting games are
+delayed until later rounds.
+
+=cut
+
+
+# first, some boilerplate:
+use strict;
+require 5.001;
+BEGIN {
+    our $VERSION = sprintf "%d.%03d", '$Revision: 1.12 $' =~ /(\d+)/g;
+}
+
+use IO::File;
+use Games::Go::AGATourn;
+use Algorithm::Pair::Best;
+use File::stat;         # stat fields by name
+
+our ($round, $nextRound, $agaTourn);
+our ($byeOpt, %drops, $byeId, %IDtoPair, @directives);
+our ($over_write, $no_rats, $no_unfinished, $no_handi, $no_early, $pairing);
+$over_write = $no_rats = $no_unfinished = $no_handi = $no_early = 0;
+
+# scoreSubs: subroutines for Pair to call when scoring a candidate
+our @scoreSubs = (
+    sub { # difference in rating.
+        my ($my, $candidate, $explain) = @_;
+
+        # the multiplier on this is 1, so that makes this the 'normal' factor
+        my $score = -(abs($my->rating - $candidate->rating));
+        $score -= 5 if ($score >= 9);   # even more penalty for more than 9 stones
+        $score = -rand(0.1) if ($no_handi);     # very small randomization
+        return sprintf "%5.1fr", $score if ($explain);
+        return $score;
+    },
+    sub { # already played?
+        my ($my, $candidate, $explain) = @_;
+
+        my $already = -0;
+        foreach (@{$my->{info}{played}}) {
+            $already++ if ($_ eq $candidate->id);       # we might have played him several times!
+        }
+        # large penalty for each time we've already played
+        my $score = -16 * $already;
+        return sprintf "%3.0fp", $score if ($explain);
+        return $score;
+    },
+    sub { # number of wins.  encourage winners agains winners.
+        my ($my, $candidate, $explain) = @_;
+
+        # 1.5 stone penalty for each difference in win scores
+        my $score = -1.5 * abs($my->wins - $candidate->wins);
+        return sprintf "%4.1fw", $score if ($explain);
+        return $score;
+    },
+    sub { # belong to the same club?
+        my ($my, $candidate, $explain) = @_;
+
+        return 0 if ($no_handi);
+        # small penalty for being in the same club
+        my $score = (($my->{info}{club} ne '') and
+                     ($my->{info}{club} eq $candidate->{info}{club})) ? -2 : 0;
+        return sprintf "%1.0fc", $score if ($explain);
+        return $score;
+    },
+);
+
+sub Usage {
+    print("\nUsage: gopair [options]     run pairings for round Number\n");
+    print("  options:\n");
+    print("      -rr       use round-robin pairing\n");
+    print("      -best     use \'best\' pairing (this is the default)\n");
+    print("      -nr       don't create/read the ratings adjustment file\n");
+    print("      -nu       don't warn if unfinished games are found\n");
+    print("      -ow       overwrite .tde file if it already exists\n");
+    print("      -nh       no handicaps (same as ##HANDICAPS MIN directive)\n");
+    print("      -ne       suppress early-round adjustment (same as ##NOEARLY directive)\n");
+    print("      -bye ID   force ID to be the BYE player for this round\n");
+    print("      -drop ID  DROP ID for this round\n");
+    print("      N         N is the round number to pair\n");
+    print("\n");
+}
+
+=head1 OPTIONS
+
+With no options, gopair reads the register.tde file and all available round
+files (of the form 1.tde, 2.tde...).   gopair then generates pairings for the
+next round following the last available round file.  Output files are N.tde
+and pairs_N.txt (where N is the number following the last available round
+file).
+
+The following options modify gopair default behavior:
+
+=over 4
+
+=item B<-rr>, B<-best>
+
+Normally, gopair uses the 'Best' pairing algorithm (as described in perldoc
+Algorithm::Pair::Best).  Best pairing can lead to bad results when the number
+of players is only slightly greater than the number of rounds to be played.
+Specifically, it might pair early rounds such that in the final round, there
+is no choice but to pair people who have already played each other.
+
+In this case, round-robin pairing is better.  Use -rr, or better, add the
+following directive to the register.tde file:
+
+    ## PAIR ROUND_ROBIN
+
+gopair will abort if best (the default) pairing is selected and round-robin
+appears to be better.  If you really need to use best pairing in this case,
+over-ride the abort by adding:
+
+    ## PAIR BEST
+
+to the register.tde file.
+
+=item B<-nr>
+
+When pairing a handicap tournament (##HANDICAPS MAX), gopair attempts to read
+a ratings adjustment file of the form 'rats_N.txt'.  If such a file is not
+found, or if it is found but it's older than its corresponding result file
+(N.tde where N is the previous round), gopair runs the 'rats' script to create
+an up-to-date ratings adjustment file.  The adjusted ratings are used instead
+of the entry-time ratings in register.tde to pair the next round.
+
+Generation and reading of the ratings adjustment file can be suppressed with
+the B<-nr> (no ratings) option.
+
+For non-handicapped tournaments it is better to use the:
+
+    ##HANDICAPS MIN
+
+directive in the register.tde file (which also prevents ratings adjustment)
+because there is no chance to accidentally forget to suppress ratings
+adjustments for a round.
+
+If you wish to pair a handicapped tournament but prevent ratings adjustments,
+it is better to use:
+
+    ## NORATS
+
+in register.tde which is equivilent to the B<-nr> option.
+
+Ratings adjustment is never performed when pairing round 1.
+
+=item B<-nu>
+
+If games are found in the round files that do not yet have a result (i.e. the
+result is not 'w', 'W', 'b', or 'B'), gopair prints a warning message and asks
+if you wish to proceed.  The query can be suppressed with the B<-nu> (no
+unfinished) option.
+
+=item B<-ow>
+
+If the round that gopair is attempting to create already exists, gopair
+normally prints a warning and asks if you wish to proceed.  The warning and
+query can be suppressed with the B<-ow> (overwrite) option.
+
+=item B<-nh>
+
+gopair normally tries to pair a handicap tournament.  This is not appropriate
+for an 'open' tournament, for example.  Handicapping can be turned of by
+adding a directive to the register.tde file:
+
+    ## HANDICAPS MIN
+
+or by using the B<-nh> (no handicaps) option.  The directive in the
+register.tde file is preferred because it reduces the chance that rounds might
+be paired with handicapping left on by mistake.
+
+When handicapping is disabled, the pairing score ignores both the difference
+in rating and whether or not players belong to the same club.  (see
+B<DESCRIPTION> above).  In addition, handicap stones for all games is set to
+-0, and komi for all games is set to either 7.5 for ING rules or 6.5 for
+non-ING rules.
+
+=item B<-ne>
+
+gopair normally adjusts early round pairing to reduce the chance of pairing
+the most interesting matches in the first rounds.  The B<-ne> option or the:
+
+    ## NOEARLY
+
+directive suppresses this adjustment.
+
+Early round adjustment is done by changing the cached pairing scores after an
+initial scoring sort.  The top N-1 candidates for the top 2 * N players get 2
+* the score of candidate N added to their score.  This drops the first N-1
+candidates to somewhere below candidate N.  N is the total number of rounds
+minus the current round number minus 2.
+
+The adjustment is fairly strong in round 1, relatively mild in the third to the
+last round, and there is no adjustment for the last two rounds.
+
+=item B<-bye> id
+
+Forces player B<id> to be the BYE player for this round.  If B<id> is not a
+valid AGA ID, gopair aborts with an error.  Using B<-bye> when there are
+an even number of players to pair has no effect (see B<-drop>).  Only one
+B<-bye> option is accepted, and if provided, it over-rides BYE players in the
+register.tde file.
+
+=item B<-drop> id
+
+Force player B<id> to be the DROPped for this round.  If B<id> is not a valid
+AGA ID, gopair aborts with an error.  Any number of B<-drop>s may be used.
+
+=item B<N> (where N is a round number)
+
+gopair attempts to pair round B<N>.  If round B<N> already exists, a warning
+is issued and gopair asks if you wish to proceed (see the B<-ow> option
+above).  If any round less than B<N> does not exists, gopair aborts with an
+error.
+
+=cut
+
+for (my $ii = 0; $ii < @ARGV; $ii++) {
+    if ($ARGV[$ii] eq '-ow') {
+        $over_write = 1;
+    } elsif ($ARGV[$ii] eq '-nr') {         # no ratings adjustment file?
+        $no_rats = 1;
+    } elsif ($ARGV[$ii] eq '-nu') {         # no warning for unfinished games?
+        $no_unfinished = 1;
+    } elsif ($ARGV[$ii] eq '-nh') {         # no handicaps
+        $no_handi = 1;
+    } elsif ($ARGV[$ii] eq '-ne') {         # no early round adjustment
+        $no_early = 1;
+    } elsif ($ARGV[$ii] eq '-rr') {         # use round-robin pairing
+        $pairing = 'rr';
+    } elsif ($ARGV[$ii] eq '-best') {       # use best pairing
+        $pairing = 'best';
+    } elsif ($ARGV[$ii] eq '-bye') {        # bye player
+        die ("Please provide an AGA ID for the -bye option\n") unless defined($ARGV[++$ii]);
+        die ("I can only accept one -bye option\n") if defined($byeOpt);
+        $byeOpt = Games::Go::AGATourn->NormalizeID($ARGV[$ii]);
+    } elsif ($ARGV[$ii] eq '-drop') {       # drop a player
+        die ("Please provide an AGA ID for the -drop option\n") unless defined($ARGV[++$ii]);
+        $drops{Games::Go::AGATourn->NormalizeID($ARGV[$ii])} = 1;
+    } elsif ($ARGV[$ii] =~ m/\D/) {         # not a number?
+        print("unknown option: $ARGV[$ii]\n");
+        Usage();
+        exit(1);
+    } else {
+        if (defined($nextRound)) {
+            print("\nI can only handle one round at a time\n");
+            Usage();
+            exit(1);
+        }
+        $nextRound = $ARGV[$ii];
+    }
+}
+
+# create agaTourn, read register.tde and all round files up to $nextRound, or
+# all round file if $nextRound isn't set.
+$round = $nextRound - 1 if (defined($nextRound));
+
+# read register.tde.  If nextRound not called out on command line, read all
+# round files too.  Otherwise, read up to nextRound - 1:
+if (defined($nextRound)) {
+    $agaTourn = Games::Go::AGATourn->new(Round => 0);
+    die("Error in AGATourn\n") if (not defined($agaTourn) or $agaTourn->Error);
+    for ($round = 1; $round < $nextRound; $round++) {
+        last unless (-f "$round.tde");
+        $agaTourn->ReadRoundFile("$round.tde");
+    }
+    $round--;
+    if ($nextRound != $round + 1) {
+        die("The last valid round file is $round.tde, I can't pair round $nextRound\n");
+    }
+} else {
+    $agaTourn = Games::Go::AGATourn->new;
+    die("Error in AGATourn\n") if (not defined($agaTourn) or $agaTourn->Error);
+    $round = $agaTourn->Round || 0;
+    $nextRound = $round + 1;
+}
+die("Error in AGATourn\n") if ($agaTourn->Error);
+
+$no_rats = 1 if (defined($agaTourn->Directive('NORATS')));
+push(@directives, 'NoRats') if $no_rats;
+$no_rats = 1 if ($round < 1);
+$no_early = 1 if (defined($agaTourn->Directive('NOEARLY')));
+unless(defined($pairing)) {
+    if (defined($agaTourn->Directive('PAIR'))) {
+        $pairing = $agaTourn->Directive('PAIR')->[0];
+        if ($pairing =~ m/^round_robin$/i) {
+            $pairing = 'rr';
+        }elsif ($pairing =~ m/^best$/i) {
+            $pairing = 'best';
+        } else {
+            die ("Unknown PAIR directive in register.tde: $pairing\n" .
+                 "    I only know about 'BEST' and ROUND_ROBIN'\n");
+        }
+    } else {
+        $pairing = 'best';
+    }
+}
+if (defined($agaTourn->Directive('HANDICAPS'))) {
+    $no_handi = 1 if (uc($agaTourn->Directive('HANDICAPS')->[0]) eq 'MIN');
+}
+push(@directives, 'Pairing:' . (($pairing eq 'rr') ? 'Round_Robin' : 'Best'));
+push(@directives, "Handicaps:" . ($no_handi ? 'Min' : 'Max'));
+
+my $rounds = $agaTourn->Rounds;
+my $numPlayers = scalar(keys(%{$agaTourn->Rating}));
+my $numByes = 0;
+if ($numPlayers % 2) {
+    my $flags = $agaTourn->Flags;       # get ref to flags hash
+    foreach my $id (keys %{$flags}) {
+        $numByes++ if($flags->{$id} =~ m/\bbye\b/i);    # found BYE candidate>
+    }
+    if ($numByes == 1) {
+        $numByes = -1;          # bye will always be removed from pairings
+    } else {
+        $numByes = 1;           # there will always be a BYE pair, so it's like an extra person
+    }
+}
+if (($numPlayers + $numByes) == $agaTourn->Rounds + 1) {
+    if (($pairing ne 'rr') and
+        (not (defined($agaTourn->Directive('PAIR')) and
+              (uc($agaTourn->Directive('PAIR')->[0]) eq 'BEST')))) {
+        my $byeMsg = ($numByes == -1) ? " (1 Bye)" : "";
+        print("With $numPlayers players$byeMsg and $rounds rounds, I strongly suggest that\n",
+              "    you use Round Robin pairing.  Please add '## Pair Round_Robin' to the\n",
+              "    register.tde file (or '## Pair Best' to force 'Best' pairing, but be\n",
+              "    warned that 'Best' pairing could have bad results in the last round -\n",
+              "    like forcing two players who have already played to play again).\n");
+        die "Aborting...\n";
+    }
+} else {
+    if ($pairing eq 'rr') {
+        print("Note: using round_robin pairing, but 'Best' might be a better alternative\n");
+    }
+}
+
+unless ($no_unfinished) {
+    my @noResult;
+    foreach my $g (@{$agaTourn->GamesList}) {
+        my ($whiteID, $blackID, $result,
+            $handicap, $komi, $round) = split(',', $g);
+        next if ($result =~ m/^[bw]$/i);
+        $noResult[$round]++;
+    }
+    my @msg;
+    for (my $ii = 0; $ii < @noResult; $ii++) {
+        if (defined($noResult[$ii]) and ($noResult[$ii] > 0)) {
+            push (@msg, "$noResult[$ii] unfinished games in round $ii")
+        }
+    }
+    if (@msg) {
+        print(join (' and ', @msg), " - continue anyway (y/n)? ");
+        my $response = lc(<STDIN>);
+        chomp($response);
+        exit(0) unless (($response eq 'y') || ($response eq 'yes'));
+    }
+}
+
+
+my $out_filename = "$nextRound.tde";
+if (-f $out_filename) {
+    unless($over_write) {
+        print("$out_filename already exists - overwrite it (y/n)? ");
+        my $response = lc(<STDIN>);
+        chomp($response);
+        exit(0) unless (($response eq 'y') || ($response eq 'yes'));
+    }
+    print("Moving $out_filename to ${nextRound}_tde.old\n");
+    rename($out_filename, "${nextRound}_tde.old");
+}
+
+my @pairs;
+if ($pairing eq 'rr') {
+    @pairs = pairRR();
+} else {
+    @pairs = pairBest();
+}
+
+
+my $pairFileName = "pairs$nextRound";
+my $tdeFileName = "$nextRound.tde";
+print "pairing complete, writing $pairFileName and $tdeFileName\n\n";
+my $pairFP = IO::File->new(">$pairFileName") or die( "Error opening $pairFileName for writing\n");
+my $tdeFP = IO::File->new(">$tdeFileName") or die( "Error opening $tdeFileName for writing\n");
+my $totalScore = 0;
+my $line = 999;
+my $tourney = $agaTourn->Tourney;
+my $nameW = $agaTourn->NameLength;
+$nameW = ($nameW > 23) ? 23 : $nameW;   # adjusted by hand to give max 80 chars wide output
+my $nameW2 = $nameW + 9;        # name width plus some for win/loss and rating
+my $page = 1;
+my ($header, $pairTxt, $tdeTxt);
+for (my $ii = 0; $ii < @pairs; $ii+= 2) {
+    $header = headerTxt() if ($line >= 55);
+    my $id1 = $pairs[$ii];
+    my $id2 = $pairs[$ii+1];
+    my ($handi, $komi);
+    if ($no_handi) {
+        $handi = rand(2) - 1;   # random number from -1 to 1
+    } else {
+        ($handi, $komi) = $agaTourn->Handicap($id1, $id2);
+    }
+    if ($handi < 0) {
+        ($pairTxt, $tdeTxt) = pairLines($ii, $id2, $id1);
+    } else {
+        ($pairTxt, $tdeTxt) = pairLines($ii, $id1, $id2);
+    }
+    $tdeFP->print("$tdeTxt\n");
+    $pairFP->print($header, "$pairTxt\n\n");
+    print($header) if ($page == 2);
+    print("$pairTxt");
+    $header = '';
+    if($pairing eq 'best') {
+        printf "  S:% 5.1f = %s\n", score($id1, $id2), explainScores($id1, $id2);
+        $totalScore += score($id1, $id2);
+    } else {
+        print "\n";
+    }
+    $line += 2;
+}
+
+if (defined($byeId)) {
+    $pairFP->printf("BYE:  (%d)%-5.1f %s\n",
+                     $agaTourn->Wins($byeId),
+                     $agaTourn->Rating($byeId),
+                     $agaTourn->Name($byeId));
+    $line++;
+    $tdeFP->printf ("# BYE:  (%d)%-5.1f %s\n",
+                     $agaTourn->Wins($byeId),
+                     $agaTourn->Rating($byeId),
+                     $agaTourn->Name($byeId));
+    printf         ("BYE:  (%d)%-5.1f %s\n",
+                     $agaTourn->Wins($byeId),
+                     $agaTourn->Rating($byeId),
+                     $agaTourn->Name($byeId));
+}
+
+foreach my $id (keys(%drops)) {
+    $header = headerTxt() if ($line >= 55);
+    $pairFP->printf($header);
+    $pairFP->printf("DROP: (%d)%-5.1f %s\n",
+                     $agaTourn->Wins($id),
+                     $agaTourn->Rating($id),
+                     $agaTourn->Name($id));
+    $line++;
+    $tdeFP->printf ("# DROP: (%d)%-5.1f %s\n",
+                     $agaTourn->Wins($id),
+                     $agaTourn->Rating($id),
+                     $agaTourn->Name($id));
+    printf          ($header);
+    printf          ("DROP: (%d)%-5.1f %s\n",
+                      $agaTourn->Wins($id),
+                      $agaTourn->Rating($id),
+                      $agaTourn->Name($id));
+    $header = '';
+}
+
+$totalScore = int($totalScore * 100) / 100;
+$pairFP->print("Pairing score: $totalScore\n");
+$tdeFP->print ("# Pairing score: $totalScore\n");
+print         ("Pairing score: $totalScore\n");
+close $pairFP;
+close $tdeFP;
+
+sub pairLines {
+    my ($ii, $id1, $id2) = @_;
+    my ($handi, $komi);
+    if ($no_handi) {
+        ($handi, $komi) = $agaTourn->Handicap($id1, $id1);      # always even handicap
+    } else {
+        ($handi, $komi) = $agaTourn->Handicap($id1, $id2);
+    }
+    my $wId = sprintf("%*.*s (%d)%-5.1f",
+                      $nameW, $nameW, $agaTourn->Name($id1),
+                      $agaTourn->Wins($id1),
+                      $agaTourn->Rating($id1));
+    my $bId = sprintf("%5.1f(%d) %-*.*s",
+                      $agaTourn->Rating($id2),
+                      $agaTourn->Wins($id2),
+                      $nameW, $nameW, $agaTourn->Name($id2));
+    my $how;
+    if ($handi) {
+        $how = sprintf("% 2.0f   %-4s", $handi, 'hndi');
+    } else {
+        if ($komi >= 0) {
+            $how = sprintf("% 4.1f %-4s", $komi + 0.5, 'komi');
+        } elsif ($komi < -1) {
+            $how = sprintf("% 4.1f %-4s", $komi - 0.5, 'rvrs');
+        } else {
+            $how = "B win tie";
+        }
+    }
+    return (sprintf("%3d %*.*s %*.*s %-9s",       # the pairs line
+                    1 + $ii / 2,
+                    $nameW2, $nameW2, $wId,
+                    -$nameW2, $nameW2, $bId,
+                    $how),
+            sprintf("%-8s %-8s ? % 2.0f % 2.0f  # %3d %5.1f %*.*s:%*.*s",  # the .tde line
+                    $id1,
+                    $id2,
+                    $handi,
+                    $komi,
+                    1 + $ii / 2,
+                    score($id1, $id2),
+                    $nameW2, $nameW2, $wId,
+                    -$nameW2, $nameW2, $bId));
+}
+
+#################################
+#
+# subroutines for 'round-robin' pairing (as opposed to 'best')
+#
+#################################
+
+sub pairRR {
+    # get a random sorting of AGA IDs that is reproducable across
+    #     multiple calls to this script:
+    my @pairs = randomList($agaTourn->Tourney, keys %{$agaTourn->Rating});
+    for (my $ii = 0; $ii < $round; $ii++) {
+        @pairs = roundRobin(@pairs);
+    }
+    return @pairs;
+}
+
+# from a phrase and a list of items, generate a somewhat random, yet reproducable list
+#     of the items.
+sub randomList {
+    my ($phrase, @items) = @_;
+
+    use Digest::SHA1 'sha1';
+    my %hash;
+    foreach my $item (@items) {
+        my $key = sha1("$phrase,$item");
+        if (exists($hash{$key})) {
+            return(randomList("$phrase x", @items));    # try again with different phrase
+        }
+        $hash{$item} = $key;
+    }
+    return(sort {$hash{$a} cmp $hash{$b}} keys(%hash));
+}
+
+sub roundRobin {
+    my @items = @_;
+
+    my @rItems;                 # return items
+    my $ii;
+    for ($ii = 1; $ii < scalar(@items) - 1; $ii++) {
+        if ($ii % 2) {
+            $rItems[$ii + 2] = $items[$ii];     # odd items down 2
+        } else {
+            $rItems[$ii - 2] = $items[$ii];     # even items up 2
+        }
+    }
+    $rItems[1] = $rItems[0];            # item 2 should go to 1 instead of 0
+    $rItems[0] = $items[0];             # first item stays put
+    $rItems[$ii - 1] = $items[$ii];     # last item only moves 1
+    return @rItems;
+}
+
+#################################
+#
+# subroutines for 'best' pairing (as opposed to 'round-robin')
+#
+#################################
+
+# pairing score for two player IDs
+sub score {
+    my ($id1, $id2) = @_;
+
+    my $score = 0;
+    foreach my $s (@scoreSubs) {
+        $score += $IDtoPair{$id1}->$s($IDtoPair{$id2});        # verbose scoring
+    }
+    return $score;
+}
+
+# when called on to explain candidate scoring:
+sub explainScores {
+    my ($id1, $id2) = @_;
+
+    my @reasons;
+    foreach my $s (@scoreSubs) {
+        push(@reasons, $IDtoPair{$id1}->$s($IDtoPair{$id2}, 1));        # verbose scoring
+    }
+    return join('+', @reasons);
+}
+
+{
+    package Algorithm::Pair::Best;  # add some methods to the Pair object
+
+    sub rating { # add method to access ratings (used in scoreSubs above)
+        my $my = shift;
+        return $my->{info}{rating};
+    }
+
+    sub wins { # add method to access wins
+        my $my = shift;
+        return $my->{info}{wins};
+    }
+
+    sub id { # add method to access id
+        my $my = shift;
+        return $my->{info}{id};
+    }
+
+    # show progress made for each finalized pairing:
+    sub progress {
+        my ($my, $item0, $item1) = @_;
+
+        print $item0->id, " paired with ", $item1->id, "\n";
+    }
+}
+
+package main;
+
+sub pairBest {
+
+    unless($no_rats or $no_handi) {
+        # see if we need to run rats to create latest ratings file
+        my $rats_fname = "rats_$round.txt";
+        die ("Can't read $round.tde\n") unless (-r "$round.tde");
+        my $r_mtime = stat("$round.tde")->mtime or die("'stat'ing $round.tde: $!");
+        unless (-f $rats_fname and
+                (stat($rats_fname)->mtime >= $r_mtime)) {
+            system ("rats $round");     # create new ratings file
+        }
+        readRats($rats_fname);
+    }
+
+    print "loading information, ";
+    my $pair = Algorithm::Pair::Best->new(window    => 7,
+                                         scoreSubs => \@scoreSubs,
+                                         );
+
+    my @idByRating;
+
+    # collect all players who are not DROPped for this round
+    foreach my $id (keys(%{$agaTourn->Rating})) {
+        if (($agaTourn->Flags($id) =~ m/\bdrop\b/i) or
+            ($agaTourn->Comment($id) =~ m/\bdrop$nextRound\b/i)) {
+            $drops{$id} = 1;
+        } else {
+            push (@idByRating, $id) unless exists($drops{$id});
+        }
+    }
+
+    unless($no_handi) {
+        # sort non-dropped players by rating
+        @idByRating = sort {$agaTourn->Rating($b) <=> $agaTourn->Rating($a) } @idByRating;
+    }
+
+    $byeId = getBye({wins     => 1,         # exclude people with all wins
+                     extremes => 0.1,       # exclude top and bottom 10 percent
+                     missed   => 1,         # exclude people who have missed a round
+                     drop     => 1,         # exclude people who will drop a future round
+                     }, \@idByRating) if (@idByRating % 2); # even number? no BYE needed
+
+    unless(defined($agaTourn->Rating($byeId))) {
+        die ("I can't use '$byeId' for the BYE player.  It is not a\n" .
+             "valid AGA ID, or it isn't registered in this tournament\n")
+    }
+
+    foreach my $d (keys(%drops)) {
+        unless (defined($agaTourn->Rating($d))) {
+            die ("I can't DROP '$d'.  It is not a valid AGA ID, or\n" .
+                 "it isn't registered in this tournament\n")
+        }
+    }
+
+    foreach my $id (@idByRating) {
+        next if(defined($byeId) and ($id eq $byeId));
+        $IDtoPair{$id} = $pair->add(
+                # info structure attached to each item to be Pair'ed
+                #   Note: this hash is entirely user-defined,
+                #   Pair makes no assumptions about it:
+                {id     => $id,                         # so we can get back to $agaTourn information
+                 rating => $agaTourn->CollapseRating($agaTourn->Rating($id)),
+                 club   => $agaTourn->Club($id),
+                 wins   => $agaTourn->Wins($id),
+                 played => scalar($agaTourn->Played($id)),       # people $id has played already
+                 });
+    }
+
+    my $erAdj = $agaTourn->Rounds - $round;
+    unless($no_early or ($erAdj < 3)) {
+        my $ii = $erAdj * 2;        # number of players to adjust
+        $erAdj -= 2;
+        print "early round adjustment (by $erAdj)\n\n";
+        $pair->sortCandidates;      # do initial candidate sorting
+        for (my $p = $pair->next; defined($p); $p = $p->next) {
+            my $citems = $p->citems;        # ref to sorted array of candidate items
+            next if (@{$citems} < $erAdj + 1);
+            my $cscores = $p->cscores;      # ref to hash of cached scores
+            my $adj = 2 * $cscores->{$citems->[$erAdj]};  #score of item a bit down the list
+            for (my $jj = 0; $jj < $erAdj; $jj++) {
+                $cscores->{$citems->[$jj]} += $adj;
+            }
+            last if($ii-- < 0);     # stop after adjusting the top few players
+        }
+        push(@directives, 'Early_round_adjustment: Yes');
+    } else {
+        push(@directives, 'Early_round_adjustment: No');
+    }
+
+    print "picking pairs\n\n";
+    my @items = $pair->pick;
+    my @pairs;
+    foreach (@items) {
+        push (@pairs, $_->id);  # convert form pair items to AGA IDs.
+    }
+    return @pairs;
+}
+
+=head1 BYEs
+
+BYEs are assigned when there are an odd number of players to pair (after all
+DROPped players have been removed).  If any players are assigned as BYE
+players in the register.tde file, those players are the entire pool of BYE
+candidates.  Otherwise, the BYE candidates consist of the middle 80% of
+players (sorted by rating) who have already lost some games (except in round
+1), and who have not already missed one or more rounds (due to DROPs or BYEs).
+The final BYE player for the round is chosen randomly from amongst the
+candidates.  Re-running gopair will most likely choose a different random BYE
+player (unless the B<-bye> option is used).
+
+=cut
+
+sub getBye {
+    my ($rules, $candidates) = @_;
+
+    return($byeOpt) if (defined($byeOpt));      # defined on command line - overrides everything else
+    my $count = @{$candidates};
+    return(undef) unless ($count);
+    my (@cand, @explicit);
+    my $round = $agaTourn->Round;
+    foreach(my $ii = 0; $ii < $count; $ii++) {
+        my $id = $candidates->[$ii];
+        next unless(defined($id));
+        push(@explicit, $id) if ($agaTourn->Flags($id) =~ m/\bbye\b/i);
+        next if (exists($rules->{extremes}) and 
+                 (($ii < $count * $rules->{extremes}) or
+                  ($ii > $count * (1 - $rules->{extremes}))));  # exclude top and bottom extremes
+        next if (exists($rules->{missed}) and
+                 (@{$agaTourn->Played($id)} < $round));      # skip if alrady missed a round
+        next if (exists($rules->{wins}) and
+                 ($agaTourn->Wins($id) >= $round));          # skip if haven't lost any games
+        next if (exists($rules->{drop}) and
+                 ($agaTourn->Comment($id) =~ m/\bdrop(\d+)\b/i) and
+                 ($1 > $round));                         # skip if going to miss a round
+        push(@cand, $id);
+    }
+    @cand = @explicit if (@explicit);          # explicit BYE candidates have priority
+    unless(@cand) {
+        foreach(qw(drop missed extremes wins)) {
+            if (exists($rules->{$_})) {
+                delete($rules->{$_});
+                return(getBye($rules, $candidates));
+            }
+        }
+        die "I ran out of rules to delete while finding a BYE candidate - please selecton on explicitly\n";
+    }
+    #finally, bye candidate should have played as many games as possible
+    my $wins = 0;
+    foreach my $id (@cand) {
+        $wins = @{$agaTourn->Played($id)} if ($wins < @{$agaTourn->Played($id)});
+    }
+    @explicit = ();
+    foreach my $id (@cand) {
+        push(@explicit, $id) if (@{$agaTourn->Played($id)} >= $wins);
+    }
+
+    return($explicit[int(rand(scalar(@explicit)))]);    # the sacrificial lamb
+}
+
+sub headerTxt {
+    my $h;
+    $h .=        ("\f") if ($page > 1);
+    $h .=        ("\n $tourney\n (");
+    $h .= join(', ', @directives);
+    $h .=        (")\n Round $nextRound of $rounds, page $page\n");
+    $h .= sprintf("\n    %*.*s %-*.*s\n",
+                  $nameW2, $nameW2, 'White          ',
+                  $nameW2, $nameW2, '          Black');
+    $line = 7;
+    $page++;
+    return($h);
+}
+
+# read ratings file, update AGATourn database with new reatings
+sub readRats {
+    my $rats_filename = shift;
+    if (-f ($rats_filename)) {
+        my $inFp = IO::File->new("<$rats_filename") or die "can't open $rats_filename for reading: $!\n";
+        print "reading $rats_filename for ratings adjustments\n";
+        while (<$inFp>) {
+            # USA2172         Watanabe, Makoto:  -5.633 (  4.500 -->  -3.133)
+            next unless(m/^(\S*).*\(.* \-\->\s+([\d\.\-]+)\)/);
+            my ($id, $newRat) = ($1, $2);
+            $agaTourn->Rating($id, $newRat);
+        }
+        close $inFp;
+    } else {
+        print "No rating adjustment file for round $round (should be $rats_filename)\n";
+        print("Continue anyway? (y/n)? ");
+        my $response = lc(<STDIN>);
+        chomp($response);
+        exit(0) unless (($response eq 'y') || ($response eq 'yes'));
+    }
+}
+__END__
+
+=head1 *.tde FILES
+
+The *.tde files all follow the standard American Go Association (AGA) defined
+formats.  In particular, in the register.tde file, gopair recognizes the:
+
+    ## RULES ...
+
+directive with respect to ING and non-ING komi and handicapping, the:
+
+    ## NOEARLY
+
+directive to suppress early-round adjustments, and:
+
+    ## HANDICAPS MIN
+
+directive to turn off handicapping.  Also, name lines in the register.tde file
+that include BYE or DROP are recognized as BYE candidates or players who have
+DROPped out, respectively.  In addition, if a name line includes one or more
+DROPn tokens in the comment field, that player is DROPped for round 'n'.
+
+Example:
+
+    USA54321  Foo, A.  10k CLUB=foobar  bye  # drop2
+    TMP65432  Bar, B.   2k CLUB=foobar       # drop3, DROP5
+
+Player A. Foo is a BYE candidate (first choice to receive BYEs if there are an
+odd number of players), and he will NOT be paired in round 2 (regardless of
+BYEs).  Player B. Bar will not be paired in rounds 3 or 5.
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o rats(1)     - calculate new ratings from game results
+
+=item o around(1)   - old Accelerat pairing script (use gopair instead)
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tscore(1)   - score a tournament
+
+=item o send2AGA(1) - prepare tournament result for sending to AGA
+
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=item o Algorithm::Pair::Best(3)     - generalized pairing algorithm
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 1995, 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

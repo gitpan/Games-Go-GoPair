@@ -1,0 +1,521 @@
+#!/usr/local/bin/perl -w
+# $Id: tscore,v 1.20 2005/01/06 22:28:31 reid Exp $
+
+#   tscore - perl script to calculate score, SOS, SODS, and
+#       head-to-head tie breakers.  input is in AGA tournament
+#       data format
+
+#   Copyright (C) 1995, 2004, 2005 Reid Augustin reid@netchip.com
+#                      1000 San Mateo Dr.
+#                      Menlo Park, CA 94025 USA
+
+#   This library is free software; you can redistribute it and/or modify it
+#   under the same terms as Perl itself, either Perl version 5.8.5 or, at your
+#   option, any later version of Perl 5 you may have available.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT
+#   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+#   FITNESS FOR A PARTICULAR PURPOSE.
+#
+
+use strict;
+require 5.001;
+use IO::File;
+use Games::Go::AGATourn;
+our ($scoreFP, $summaryFP, $tourn, $mcMahon, $bar, $columns, $myName, $lastRound, $Rounds);
+our (%gameCount, %oppByRound, %color, %handi, %result, %wins, %beat, %mcmahonBand);
+our (%ties, %games, %som, %sodm, %sos, %sods, %place, %hth);
+our (@bands, $name, $rating, %index, $finalRound, @badResult);
+
+$myName = $0;           # full pathname of this file
+$myName =~ s".*/"";     # delete any preceding path
+
+
+$mcMahon = 0;           # default is to not do McMahon scoring
+$bar = 6;               # set default McMahon "bar" at 6
+
+$columns = 80;          # set default paper width to 80 columns
+$Rounds = $lastRound = 1; # assume only one round to start with
+
+sub Score {
+
+    $tourn = Games::Go::AGATourn->new() or die $!;
+    my $scoreFileName = "scores.txt";
+    die("Aborting ($scoreFileName not written)...\n") if ($tourn->Error());
+    $scoreFP = IO::File->new(">$scoreFileName") or
+        die("Error opening $scoreFileName for writing\n");
+    my $summaryFileName = "summary.txt";
+    $summaryFP = IO::File->new(">$summaryFileName") or 
+        die("Error opening $summaryFileName for writing\n");
+    $name = $tourn->Name();          # ref to names keyed by ID
+    $rating = $tourn->Rating();      # ref to rating keyed to ID
+    foreach (keys(%{$name})) {
+        my $band = $tourn->WhichBandIs($rating->{$_});                  # get band index
+        if (defined($band) and ($band >= 0)) {
+            push(@{$bands[$band]}, $_);     # put players into bands
+        } else {
+            my $name = $tourn->Name($_);
+            die("\n    $name ($_) with a rating of " . $rating->{$_} . " is not in any scoring band.\n" .
+                "    Please adjust ##BAND directives in register.tde to cover all players.\n\n");
+        }
+        $games{$_} = $wins{$_} = $sos{$_} = $sods{$_} = $som{$_} = $sodm{$_} = $hth{$_} = 0; # init all tiebreakers
+        $mcmahonBand{$_} = int($rating->{$_});
+        $mcmahonBand{$_} = $bar if ($mcmahonBand{$_} > $bar);
+        if ($mcmahonBand{$_} < 0) {
+            $mcmahonBand{$_}++;         # adjust for gap between 1D and 1K
+        }
+    }
+    print("Counting:\n Games,\n Wins,");
+    CountGamesWins();
+    for (my $ii = 0; $ii < @badResult; $ii++) {
+        if (defined($badResult[$ii])) {
+            printf("\n\nNote: $badResult[$ii] bad result%s in round $ii.\n\n", ($badResult[$ii] > 1) ? 's' : '');
+            unless (defined($finalRound)) {
+                print("  To include round $ii, add \"-fr $ii\" (final_round - use the last round you want to include).\n");
+                $finalRound = $ii - 1;
+                last;
+            }
+        }
+    }
+    $finalRound = 999 unless (defined($finalRound));
+    if ($mcMahon) {
+        print("\n Sum of Opponents' McMahon bands (SOM),");
+        CountSOS();
+        print("\n Sum of Defeated Opponents' McMahon bands (SODM),");
+        CountSODS();
+        print("\n Place,");
+        CountPlace();
+        print("\n Ties.");
+        CountTies();
+    } else {
+        print("\n SOS,");
+        CountSOS();
+        print("\n SODS,");
+        CountSODS();
+        print("\n Place,");
+        CountPlace();
+        print("\n Ties,");
+        CountTies();
+        print("\n Head to Head,");
+        CountHeadToHead();
+        print("\n Re-count Ties.");
+        CountTies();
+    }
+    $Rounds = $tourn->Rounds();
+    $Rounds = $lastRound if ($lastRound > $Rounds);
+    $lastRound = $finalRound if ($finalRound < $lastRound);
+    print("\nPrinting scores to $scoreFileName");
+    PrintScores();
+    $scoreFP->close();
+    print("\nPrinting summary to $summaryFileName");
+    PrintSummary();
+    $summaryFP->close();
+    print("\n");
+}
+
+sub PrintSummary {
+    my ($id, $opp, $round, $band, $place, %line);
+    $summaryFP->print("  " . $tourn->Tourney() . "\n");
+    if ($lastRound < $Rounds) {
+        $summaryFP->print("  Summary after Round $lastRound (of $Rounds)\n\n");
+    } else {
+        $summaryFP->print("  Final Summary ($Rounds Rounds)\n\n");
+    }
+
+    my $nameWidth = $tourn->NameLength();
+    my ($digits, $entrants);
+    $digits = 1;
+    for ($entrants = keys(%{$name}); $entrants > 9; $digits++) { # digits to represent all players?
+        $entrants = int($entrants / 10);
+    }
+    if ($columns - ($digits + 1 + 5 + 1 + $nameWidth + ($lastRound * (1 + 1 + 2 + 1 +$digits))) < 0) {
+            # trim names to make summary info fit
+        $nameWidth = $columns - ($digits + 1 + 5 + 1 + ($lastRound * (2 + 1 + $digits + 1 + 3)));
+        if ($nameWidth < 10) {
+            print("Note: I can't make this fit into $columns columns.\n");
+            $nameWidth = $tourn->NameLength();       # I give up...
+        }
+    }
+    foreach $id (keys(%{$name})) {
+        my $idx = exists($index{$id}) ? sprintf("%-*d", $digits, $index{$id}) : 'none';
+        $line{$id} = sprintf("$idx %5.1f %*.*s ", $rating->{$id}, -$nameWidth, $nameWidth, $name->{$id});
+    }
+    foreach $id (keys(%oppByRound)) {
+        for ($round = 1; $round <= $lastRound; $round++) {
+            if (defined($oppByRound{$id}{$round})) {
+                $opp = $oppByRound{$id}{$round};
+                my $oppIdx = exists($index{$opp}) ? sprintf("%-*d", $digits, $index{$opp}) : 'none';
+                $line{$id} .= " $color{$round}{$id}$result{$round}{$id}$handi{$round}{$id}:$oppIdx";
+            } else {
+                $line{$id} .= '        ';
+            }
+        }
+    }
+    my $space = ' ' x ($digits - 1);
+    my $dashx = '-' x ($digits - 1);
+    my $nameSpace = ' ' x $nameWidth;
+    my $header;
+    $header  = "$space        $nameSpace  +---> color (white or black)\n";
+    $header .= "$space        $nameSpace  |+---> '+' for win, '-' for loss\n";
+    $header .= "$space        $nameSpace  ||+---> 'h'=handi, 'k'=komi, 'r'=rvrs komi\n";
+    $header .= sprintf("%-*.*s Rank %-*.*s  |||  +-> opponent Idx (far left column)\n",
+                                $digits + 1, $digits + 1, 'Idx',
+                                $nameWidth, $nameWidth, 'Name');
+    $header .= "$space        $nameSpace  |||  |\n";
+    for ($band = 0; $band < @bands; $band++) {
+        next unless (@{$bands[$band]});
+        $summaryFP->print("\n    Band " . $tourn->BandName($band) . "\n");
+        $summaryFP->print($header);
+        foreach (sort({SortPlace($a, $b)} @{$bands[$band]})) {
+            $summaryFP->print("$line{$_}\n");
+        }
+        $summaryFP->print("\n");
+    }
+}
+
+sub PrintScores {
+    my ($band, $place, $id, $tieStr, %line);
+
+    $scoreFP->print("  " . $tourn->Tourney() . "\n");
+    if ($lastRound < $Rounds) {
+        $scoreFP->print("  Scores after Round " . $lastRound . " (of " . $Rounds . ")\n\n");
+    } else {
+        $scoreFP->print("  Final Scores (" . $Rounds . " Rounds)\n\n");
+    }
+    foreach $band (@bands) {
+        foreach $id (@{$band}) {
+            if ($ties{$id} > 1) {
+                $tieStr = "($ties{$id} way tie)";
+            } else {
+                $tieStr = '';
+            }
+            if ($mcMahon) {
+                $line{$id} = sprintf("%-8s %-28s %2d/%-2d %2d %4d %4d %2d  %2d %3d %s\n",
+                    $id, "$name->{$id} $rating->{$id}", $wins{$id}, $games{$id},
+                    $mcmahonBand{$id}, $som{$id}, $sodm{$id},
+                    $sos{$id}, $sods{$id},
+                    $place{$id} + 1, $tieStr);
+            } else {
+                $line{$id} = sprintf("%-8s %-28s %2d/%-2d  %3d %3d  %2d  %3d %s\n",
+                    $id, "$name->{$id} $rating->{$id}", $wins{$id}, $games{$id},
+                    $sos{$id}, $sods{$id}, $hth{$id},
+                    $place{$id} + 1, $tieStr);
+            }
+        }
+    }
+    my $idx = 1;
+    for ($band = 0; $band < @bands; $band++) {
+        next unless (@{$bands[$band]});
+        $scoreFP->print("\n    Band " . $tourn->BandName($band) . "\n\n");
+        if ($mcMahon) {
+            $scoreFP->print("ID       Name                   Wins/Games MBnd SOM SODM SOS SODS Place\n\n");
+        } else {
+            $scoreFP->print("ID       Name                    Wins/Games  SOS SODS HtH Place\n\n");
+        }
+        foreach (sort({SortPlace($a, $b)} @{$bands[$band]})) {
+            $index{$_} = $idx++;                        # assign an index for each player (used in the summary)
+            $scoreFP->print($line{$_});
+        }
+        $scoreFP->print("\n\n");
+    }
+}
+
+sub SortPlace {
+    my ($idA, $idB) = @_;
+
+    return($place{$idA} <=> $place{$idB}) if ($place{$idA} != $place{$idB});
+    return($rating->{$idB} <=> $rating->{$idA});        # stronger player first
+}
+
+sub CountGamesWins  {
+    my ($gameIdx, $wId, $bId, $wIdx, $bIdx, $resu, $handi, $komi, $round);
+    foreach (@{$tourn->GamesList()}) {
+        ($wId, $bId, $resu, $handi, $komi, $round) = split(/,/);
+        if ($bId eq 'USA6068') {
+            print("$_\n");
+        }
+        if ($wId eq 'USA6068') {
+            print("$_\n");
+        }
+        $wIdx = $bIdx = $round;                 # this solves problem of multiple games in one round
+        if (defined($oppByRound{$wId}{$wIdx})) {
+            $wIdx = 1 + keys(%{$oppByRound{$wId}});       # next empty slot
+        }
+        if (defined($oppByRound{$bId}{$bIdx})) {
+            $bIdx = 1 + keys(%{$oppByRound{$bId}});       # next empty slot
+        }
+        $lastRound = $wIdx if ($wIdx > $lastRound);     # remember max rounds
+        $lastRound = $bIdx if ($bIdx > $lastRound);
+        $oppByRound{$wId}{$wIdx} = $bId;        # set opponents for each round
+        $oppByRound{$bId}{$bIdx} = $wId;
+        $color{$wIdx}{$wId} = 'w';              # set colors held
+        $color{$bIdx}{$bId} = 'b';
+        if ($handi) {
+            $handi = "h$handi";         # set handicap
+        } else {
+            if (($komi == -1) and
+                (uc($tourn->Directive('RULES')->[0]) eq 'ING')) {
+                $komi = 0;
+            }
+            if ($komi < 0) {
+                $komi = -$komi;
+                $handi = "r$komi";      # set reverse komi
+            } else {
+                $handi = "k$komi";      # set komi
+            }
+        }
+        $handi{$wIdx}{$wId} = $handi;
+        $handi{$bIdx}{$bId} = $handi;
+        $resu = uc($resu);
+        if ($resu eq 'W') {
+            $result{$wIdx}{$wId} = '+';
+            $result{$bIdx}{$bId} = '-';
+            $beat{$wId}{$bId} = 1;
+            $wins{$wId}++;
+            $mcmahonBand{$wId}++;
+            $games{$wId}++;             # both finished one more game
+            $games{$bId}++;
+        } elsif ($resu eq 'B') {
+            $result{$bIdx}{$bId} = '+';
+            $result{$wIdx}{$wId} = '-';
+            $beat{$bId}{$wId} = 1;
+            $wins{$bId}++;
+            $mcmahonBand{$bId}++;
+            $games{$wId}++;             # both finished one more game
+            $games{$bId}++;
+        } else {
+            STDERR->print("Unknown game result \"$resu\" between $wId and $bId in round $round\n");
+            $result{$wIdx}{$wId} = '?';
+            $result{$bIdx}{$bId} = '?';
+            $badResult[$round]++;
+        }
+    }
+}
+
+# Sum of Opponents' scores
+sub CountSOS {
+    my ($round, $id, $opp);
+    foreach $id (keys(%oppByRound)) {
+        foreach $round (keys(%{$oppByRound{$id}})) {
+            next if ($round > $finalRound);
+            $opp = $oppByRound{$id}{$round};
+            if (defined($opp)) {                # did I play this round?
+                $sos{$id} += $wins{$opp};
+                $som{$id} += $mcmahonBand{$opp};
+            }
+        }
+    }
+}
+
+# Sum of Defeated Opponents' scores
+sub CountSODS {
+    my ($round, $id, $opp);
+    foreach $id (keys(%oppByRound)) {
+        foreach $round (keys(%{$oppByRound{$id}})) {
+            next if ($round > $finalRound);
+            $opp = $oppByRound{$id}{$round};
+            if (defined($opp)) {                        # did I play this round?
+                if (defined($beat{$id}{$opp})) {        # did I beat him?
+                    $sods{$id} += $wins{$opp};
+                    $sodm{$id} += $mcmahonBand{$opp};
+                }
+            }
+        }
+    }
+}
+
+sub CountPlace {
+    my ($id, $opp, $band);
+    foreach $band (@bands) {
+        foreach $id (@{$band}) {
+            foreach $opp (@{$band}) {
+                next if ($opp eq $id);          # don't count myself
+                if ($mcMahon) {
+                    $place{$id} += McMahonPlace($id, $opp);
+                } else {
+                    $place{$id} += Place($id, $opp);
+                }
+            }
+        }
+    }
+}
+
+sub McMahonPlace {
+    my ($id, $opp) = @_;
+
+    return(1) if ($mcmahonBand{$opp} > $mcmahonBand{$id}); # opp beat me on mcmahon band
+    if ($mcmahonBand{$opp} == $mcmahonBand{$id}) {
+        return(1) if ($som{$opp} > $som{$id}); # opp beat me on SOM
+        if ($som{$opp} == $som{$id}) {
+            return(1) if ($sodm{$opp} > $sodm{$id}); # opp beat me on SODM
+            if ($sodm{$opp} == $sodm{$id}) {
+                return(1) if ($sos{$opp} > $sos{$id}); # opp beat me on SOS
+                if ($sos{$opp} == $sos{$id}) {
+                    return(1) if ($sods{$opp} > $sods{$id}); # opp beat me on SODS
+                }
+            }
+        }
+    }
+    return(0);          # he didn't beat me
+}
+
+sub Place {
+    my ($id, $opp) = @_;
+
+    return(1) if ($wins{$opp} > $wins{$id}); # opp beat me on wins
+    if ($wins{$opp} == $wins{$id}) {
+        return(1) if ($sos{$opp} > $sos{$id}); # opp beat me on SOS
+        if ($sos{$opp} == $sos{$id}) {
+            return(1) if ($sods{$opp} > $sods{$id}); # opp beat me on SODS
+        }
+    }
+    return(0);          # he didn't beat me
+}
+
+sub CountTies {
+    my ($band, $id, $opp);
+    foreach(keys(%{$name})) {
+        $ties{$_} = 1;          # clear ties hash
+    }
+    foreach $band (@bands) {
+        foreach $id (@{$band}) {
+            foreach $opp (@{$band}) {
+                next if ($id eq $opp);
+                if ($place{$id} == $place{$opp}) {
+                    $ties{$id}++;
+                }
+            }
+        }
+    }
+}
+
+sub CountHeadToHead {
+    my ($band, $id, $opp);
+    foreach $band (@bands) {
+        foreach $id (@{$band}) {
+            foreach $opp (@{$band}) {
+                next if ($id eq $opp);                  # don't count myself
+                next unless ($place{$id} == $place{$opp});      # not a tie?
+                next unless ($ties{$id} == 2);          # only look at two-way ties
+                if (defined($beat{$id}{$opp})) {
+                    $hth{$id} = 1;                      # I get a Head to Head point
+                    $place{$opp}++;                     # I beat him, so drop him down
+                }
+            }
+        }
+    }
+}
+
+sub Usage {
+    STDERR->print("Usage: $myName [-m [-b bar]] [-co columns]\n",
+                  "  score an AGA tournament.  Options:\n",
+                  "   -m            uses McMahon scoring.\n",
+                  "   -b bar        set McMahon bar (default = 6)\n",
+                  "   -co columns   set max columns for output (default = 80)\n",
+                  );
+}
+
+# OK, here is where things actually happen
+
+my $ii;
+
+for ($ii = 0; $ii < @ARGV; $ii++) {
+    if ($ARGV[$ii] eq '-m') {
+        $mcMahon = 1;
+    } elsif (($ARGV[$ii] eq '-co')) {
+        $columns = $ARGV[++$ii];
+    } elsif ($ARGV[$ii] eq '-b') {
+        $bar = $ARGV[++$ii];
+    } elsif ($ARGV[$ii] eq '-fr') {
+        $finalRound = $ARGV[++$ii];
+    } else {
+        print("unknown option: $ARGV[$ii]\n");
+        Usage();
+        exit(1);
+    }
+}
+
+Score();
+
+__END__
+
+=head1 NAME
+
+tscore - score an AGA (American Go Association) tournament
+
+=head1 SYNOPSIS
+
+tscore
+
+=head1 DESCRIPTION
+
+tscore reads all the .tde files in the current directory (normally register.tde and 1.tde,
+2.tde, etc for each round of the tournament) and calculates the scores and summaries for the
+entire tournament.  If a ##ROUNDS directive is provided in the register.tde file, tscore can
+adjust the results to reflect the total number of rounds expected.
+
+tscore normally scores by number of won games, with SOS as the first tie break, SODS as the
+second tie breaker, and Head-to-head as the third tie breaker.  Note that Head-to-head is
+limited because (for example), there can be a head-to-head lockout if A beats B, B beats C, and
+C beats A.
+
+tscore can also use McMahon scoring.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-co> columns
+Format output for 'columns' output (must be a number).  Default is 80.
+
+=item B<-m>
+Use McMahon scoring.
+
+=item B<-b> bar
+Set the McMahon bar to 'bar'.  Must be a number = use negative for kyu (same
+as AGA standard).  Default is 6 dan.
+
+=item B<-fr> round_number
+Set the total number of rounds (over-rides ##ROUNDS directive in register.tde)
+
+=back
+
+=head1 SEE ALSO
+
+=over 0
+
+=item o tdfind(1)   - prepare register.tde for an AGA Go tournament
+
+=item o around(1)   - pair a tournament round
+
+=item o aradjust(1) - adjust pairings and enter results for a round
+
+=item o tpairs(1)   - convert pairings from AGA format to printable
+
+=item o tscore(1)   - score a tournament
+
+=item o send2AGA(1) - prepare tournament result for sending to AGA
+
+
+=item o Games::Go::AGATourn(3) - perl module provides AGA file support
+
+=item o Games::Go::TDEntry(3)  - perl/Tk widget support for TDFinder
+
+=item o Games::Go::TDFinder(3) - perl/Tk tdfind support widgets
+
+=back
+
+=head1 AUTHOR
+
+Reid Augustin, E<lt>reid@netchip.comE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 1995, 2004, 2005 by Reid Augustin
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.5 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+

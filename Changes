@@ -1,0 +1,6 @@
+
+Revision history for Perl extension Games::Go::GoPair
+
+1.0001  Sat Jan 22 21:10:22 PST 2005
+    split out of Games::Go::AGA into GoPair-specific package of
+        scripts, modules, and widgets
